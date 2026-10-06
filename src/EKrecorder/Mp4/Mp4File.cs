@@ -13,6 +13,9 @@ internal sealed class TrackTable
     /// <summary>The sample entry's four-letter code (avc1, mp4a, ...).</summary>
     public string Codec { get; init; } = "";
 
+    /// <summary>The H.264 profile (Baseline, Main, High), when the track is H.264.</summary>
+    public string Profile { get; init; } = "";
+
     public uint Timescale { get; init; }
 
     public int Width { get; init; }
@@ -46,7 +49,7 @@ internal sealed class TrackTable
 
 /// <summary>A track in a few numbers, for checks and the report.</summary>
 internal sealed record TrackSummary(
-    uint Id, string Handler, string Codec, int Samples, int SyncSamples, double Seconds, double StartSeconds, long Bytes, double PeakBitsPerSecond,
+    uint Id, string Handler, string Codec, string Profile, int Samples, int SyncSamples, double Seconds, double StartSeconds, long Bytes, double PeakBitsPerSecond,
     int Width, int Height, int Channels, int SampleRate)
 {
     public double AverageBitsPerSecond => Seconds > 0 ? Bytes * 8 / Seconds : 0;
@@ -317,7 +320,7 @@ internal static class Mp4File
             return (null, $"track {id}: the chunks hold {sample} samples, stsz lists {count}");
         }
 
-        (string codec, int width, int height, int channels, int rate) = DescribeEntry(moov, stsd.Value);
+        (string codec, string profile, int width, int height, int channels, int rate) = DescribeEntry(moov, stsd.Value);
         Box? edts = BoxIo.Child(moov, trak, "edts");
         List<MoovBuilder.Edit> edits = edts is { } e2 ? MoovBuilder.ReadEdits(BoxIo.Copy(moov, e2)) : new();
         return (new TrackTable
@@ -325,6 +328,7 @@ internal static class Mp4File
             Id = id,
             Handler = handler,
             Codec = codec,
+            Profile = profile,
             Timescale = timescale,
             Width = width,
             Height = height,
@@ -356,31 +360,44 @@ internal static class Mp4File
         long last = perSecond.Count > 0 ? perSecond.Keys.Max() : 0;
         double peak = perSecond.Where(p => p.Key < last || perSecond.Count == 1).Select(p => p.Value * 8.0).DefaultIfEmpty(0).Max();
         return new TrackSummary(
-            track.Id, track.Handler, track.Codec, track.Count, track.Sync.Count(s => s), seconds, track.StartSeconds(movieTimescale), bytes, peak,
+            track.Id, track.Handler, track.Codec, track.Profile, track.Count, track.Sync.Count(s => s), seconds, track.StartSeconds(movieTimescale), bytes, peak,
             track.Width, track.Height, track.Channels, track.SampleRate);
     }
 
-    private static (string Codec, int Width, int Height, int Channels, int Rate) DescribeEntry(byte[] moov, Box stsd)
+    private static (string Codec, string Profile, int Width, int Height, int Channels, int Rate) DescribeEntry(byte[] moov, Box stsd)
     {
         int at = (int)stsd.PayloadPosition;
         if (stsd.PayloadSize < 16)
         {
-            return ("", 0, 0, 0, 0);
+            return ("", "", 0, 0, 0, 0);
         }
 
         int entry = at + 8;
         string codec = Encoding.Latin1.GetString(moov, entry + 4, 4);
         if (codec is "avc1" or "avc3" or "hvc1" or "hev1" && entry + 36 <= stsd.End)
         {
-            return (codec, BoxIo.U16(moov, entry + 32), BoxIo.U16(moov, entry + 34), 0, 0);
+            string profile = "";
+            var sampleEntry = new Box(codec, entry, BoxIo.U32(moov, entry), 8);
+            if (sampleEntry.End <= stsd.End && BoxIo.Child(moov, sampleEntry, "avcC", skip: 78) is { } avcC && avcC.PayloadSize >= 4)
+            {
+                profile = moov[avcC.PayloadPosition + 1] switch
+                {
+                    66 => "Baseline",
+                    77 => "Main",
+                    100 => "High",
+                    byte other => string.Create(CultureInfo.InvariantCulture, $"profile {other}"),
+                };
+            }
+
+            return (codec, profile, BoxIo.U16(moov, entry + 32), BoxIo.U16(moov, entry + 34), 0, 0);
         }
 
         if (codec == "mp4a" && entry + 36 <= stsd.End)
         {
-            return (codec, 0, 0, BoxIo.U16(moov, entry + 24), (int)(BoxIo.U32(moov, entry + 32) >> 16));
+            return (codec, "", 0, 0, BoxIo.U16(moov, entry + 24), (int)(BoxIo.U32(moov, entry + 32) >> 16));
         }
 
-        return (codec, 0, 0, 0, 0);
+        return (codec, "", 0, 0, 0, 0);
     }
 
     /// <summary>True when bytes <paramref name="start"/> to <paramref name="end"/> lie in one mdat's payload (<paramref name="mdats"/> in file order).</summary>

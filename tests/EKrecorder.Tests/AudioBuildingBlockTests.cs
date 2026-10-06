@@ -318,7 +318,8 @@ public sealed class OutputSizeTests
     [InlineData(5120, 1440, 1920, 540)]
     public void FitsWithoutUpscalingAndKeepsEvenSides(int width, int height, int expectedWidth, int expectedHeight)
     {
-        Size size = EKrecorder.Recording.RecordingPreset.Default.OutputSizeFor(new Size(width, height));
+        // The 1080p step.
+        Size size = EKrecorder.Recording.RecordingQuality.Preset(3, 2).OutputSizeFor(new Size(width, height));
         Assert.Equal(new Size(expectedWidth, expectedHeight), size);
     }
 }

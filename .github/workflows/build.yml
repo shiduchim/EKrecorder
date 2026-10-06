@@ -15,12 +15,13 @@ concurrency:
 
 jobs:
   build:
-    name: Build, self-test and package
+    name: Build, test and package
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       DOTNET_NOLOGO: "1"
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      APP_VERSION: "1.0.0"
 
     steps:
       - name: Check out
@@ -31,16 +32,18 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Build the solution (Debug and Release)
+      # Any compiler or analyzer warning fails the build.
+      - name: Build the solution (Debug and Release, warnings are errors)
         shell: pwsh
         run: |
-          dotnet build EKrecorder.sln -c Debug
+          dotnet build EKrecorder.sln -c Debug -warnaserror
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          dotnet build EKrecorder.sln -c Release
+          dotnet build EKrecorder.sln -c Release -warnaserror
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The audio timing tests simulate hours of device clock drift, jitter, silence and lost devices.
-      - name: Unit tests (audio timing)
+      # Audio timing (hours of drift, jitter, silence, lost devices), the crash-safe MP4 conversion (cuts at hundreds of
+      # byte positions, interrupted conversions), settings, shortcuts, disk space and quality rules.
+      - name: Unit tests
         shell: pwsh
         run: |
           dotnet test tests/EKrecorder.Tests/EKrecorder.Tests.csproj -c Release --no-build --logger "console;verbosity=normal"
@@ -48,40 +51,19 @@ jobs:
 
       - name: Publish one self-contained EKrecorder.exe (win-x64)
         shell: pwsh
-        # No single-file compression: a compressed bundle unpacks every library it loads into private memory
-        # (about 80 MB here). Uncompressed, the libraries are mapped straight from the .exe. The .exe gets bigger,
-        # the download zip stays about the same size.
+        # No single-file compression: a compressed bundle unpacks every library it loads into private memory.
+        # Uncompressed, the libraries are mapped straight from the .exe.
         run: |
           dotnet publish src/EKrecorder/EKrecorder.csproj -c Release -r win-x64 --self-contained true `
             -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false `
             -o publish/EKrecorder
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Copy-Item docs/HOW-TO-RUN.txt publish/EKrecorder/
+          Copy-Item docs/README.txt publish/EKrecorder/
           Get-ChildItem publish/EKrecorder | Format-Table Name, Length -AutoSize
 
-      - name: Encoder probe (informational)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $out = Join-Path $env:RUNNER_TEMP 'probe'
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
-          $exe = (Resolve-Path 'publish/EKrecorder/EKrecorder.exe').Path
-          $p = Start-Process -FilePath $exe -ArgumentList @('--probe', "`"$out`"") -PassThru
-          $null = $p.Handle
-          if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; Write-Host '::warning::probe hung' }
-          Get-Content (Join-Path $out 'probe-report.txt') -ErrorAction SilentlyContinue | Write-Host
-          Write-Host '===== tools on this machine ====='
-          foreach ($tool in 'iscc', 'ffmpeg', 'ffprobe', 'choco') {
-            $found = Get-Command $tool -ErrorAction SilentlyContinue
-            Write-Host "$tool : $(if ($found) { $found.Source } else { 'not found' })"
-          }
-          Get-ChildItem 'C:\Program Files (x86)\Inno Setup*', 'C:\Program Files\Inno Setup*' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Inno folder: $($_.FullName)" }
-          Write-Host "Runner image: $env:ImageOS $env:ImageVersion"
-
-      # Runs the capture test and a 6-second recording on the build machine's virtual screen, without questions. It
-      # shows whether the app starts and the Windows APIs answer on a real Windows. It never blocks the download below:
-      # the build machine has no real monitor or GPU, so the test on your own PC is the one that counts.
-      - name: Self-test on the build machine (informational)
+      # The real app on this machine's virtual screen (no GPU, no sound devices): the capture test, recordings through
+      # the tray app's own controller, recovery of a copy taken mid-recording, audio/video timing and the shortcut.
+      - name: Self-test
         id: selftest
         continue-on-error: true
         shell: pwsh
@@ -90,25 +72,138 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $exe = (Resolve-Path 'publish/EKrecorder/EKrecorder.exe').Path
           $p = Start-Process -FilePath $exe -ArgumentList @('--selftest', '--output', "`"$out`"") -PassThru
-          $null = $p.Handle  # keeps ExitCode readable after the process ends
-          if (-not $p.WaitForExit(240000)) {
-            Stop-Process -Id $p.Id -Force
-            Write-Host '::warning::The self-test did not finish within 4 minutes.'
-          }
+          $null = $p.Handle
+          if (-not $p.WaitForExit(540000)) { Stop-Process -Id $p.Id -Force; Write-Host '::warning::The self-test did not finish within 9 minutes.' }
           $p.WaitForExit()
-          $code = $p.ExitCode
-          foreach ($file in Get-ChildItem $out -Recurse -Filter '*report*.txt') {
-            Write-Host "===== $($file.Name) ====="
-            Get-Content $file.FullName | Write-Host
-          }
-          Get-ChildItem $out -Recurse -Filter '*.mp4' | ForEach-Object { Write-Host "MP4: $($_.FullName) ($($_.Length) bytes)" }
-          Write-Host '===== session log ====='
-          Get-ChildItem "$env:LOCALAPPDATA\EKrecorder\Logs" -Filter *.log -ErrorAction SilentlyContinue |
-            ForEach-Object { Get-Content $_.FullName | Write-Host }
-          Write-Host "Self-test exit code: $code"
-          exit $code
+          Get-Content (Join-Path $out 'selftest-full-report.txt') -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "Self-test exit code: $($p.ExitCode)"
+          exit $p.ExitCode
 
-      - name: Upload EKrecorder (this is the one to download)
+      # A real crash: EKrecorder is killed while it records; the next start must recover the recording.
+      - name: Crash test (kill while recording, recover at the next start)
+        id: crashtest
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'crashtest'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = (Resolve-Path 'publish/EKrecorder/EKrecorder.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList @('--selftest-record', '--output', "`"$out`"") -PassThru
+          $marker = Join-Path $out 'recording-started.txt'
+          $deadline = (Get-Date).AddSeconds(90)
+          while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline -and -not $p.HasExited) { Start-Sleep -Milliseconds 250 }
+          if (-not (Test-Path $marker)) { Write-Host '::error::The recording did not start.'; Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 1 }
+          Start-Sleep -Seconds 12
+          Stop-Process -Id $p.Id -Force
+          Write-Host "Killed EKrecorder while it was recording $(Get-Content $marker)"
+          Start-Sleep -Seconds 1
+          $r = Start-Process -FilePath $exe -ArgumentList @('--selftest-recover', '--output', "`"$out`"") -PassThru
+          $null = $r.Handle
+          if (-not $r.WaitForExit(180000)) { Stop-Process -Id $r.Id -Force; Write-Host '::warning::Recovery did not finish within 3 minutes.' }
+          $r.WaitForExit()
+          Get-Content (Join-Path $out 'selftest-recover-report.txt') -ErrorAction SilentlyContinue | Write-Host
+          exit $r.ExitCode
+
+      # The Settings window as Windows shows it, in light and in dark mode (printed as base64 for review).
+      - name: Settings window screenshots
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'publish/EKrecorder/EKrecorder.exe').Path
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $key -Force | Out-Null
+          foreach ($theme in 'light', 'dark') {
+            $value = if ($theme -eq 'dark') { 0 } else { 1 }
+            Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value $value -Type DWord
+            Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value $value -Type DWord
+            $out = Join-Path $env:RUNNER_TEMP "screenshots\$theme"
+            $p = Start-Process -FilePath $exe -ArgumentList @('--screenshot', '--output', "`"$out`"") -PassThru
+            $null = $p.Handle
+            if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force }
+            $b64 = Join-Path $out 'settings.png.base64.txt'
+            if (Test-Path $b64) {
+              Write-Host "BEGIN-PNG $theme"
+              Write-Host (Get-Content $b64 -Raw)
+              Write-Host "END-PNG $theme"
+            } else { Write-Host "No $theme screenshot." }
+          }
+          Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 1 -Type DWord
+
+      # A second opinion on audio/video timing: FFmpeg's demuxer and AAC decoder (as VLC and most players use),
+      # on the files the self-test wrote. Each white frame and its beep should be at the same time.
+      - name: Timing cross-check with FFmpeg (informational)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress | Out-Null
+          $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'selftest\sync') -Filter *.mp4 | ForEach-Object {
+            $file = $_.FullName
+            $beeps = ffmpeg -hide_banner -nostats -i $file -map 0:a -af 'silencedetect=noise=-30dB:d=0.05' -f null - 2>&1 |
+              Select-String 'silence_end: ([0-9.]+)' | ForEach-Object { [double]$_.Matches[0].Groups[1].Value }
+            $frames = ffmpeg -hide_banner -nostats -i $file -an -vf 'signalstats,metadata=print:key=lavfi.signalstats.YAVG' -f null - 2>&1 | Out-String
+            $flashes = @()
+            $time = $null
+            foreach ($line in $frames -split "`n") {
+              if ($line -match 'pts_time:([0-9.]+)') { $time = [double]$Matches[1] }
+              elseif ($line -match 'YAVG=([0-9.]+)' -and $time -ne $null) {
+                if ([double]$Matches[1] -gt 128 -and ($flashes.Count -eq 0 -or $time - $flashes[-1] -gt 0.5)) { $flashes += $time }
+              }
+            }
+            $pairs = foreach ($f in $flashes) {
+              $b = $beeps | Sort-Object { [math]::Abs($_ - $f) } | Select-Object -First 1
+              if ($b -ne $null) { '{0:+0.0;-0.0} ms' -f (($b - $f) * 1000) }
+            }
+            Write-Host "$($_.Name): white frames at $($flashes -join ', ') s; beeps at $($beeps -join ', ') s; beep minus picture: $($pairs -join ', ')"
+          }
+
+      - name: Build the installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { choco install innosetup -y --no-progress | Out-Null; $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' }
+          & $iscc "/DAppVersion=$env:APP_VERSION" installer/EKrecorder.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem publish/installer | Format-Table Name, Length -AutoSize
+
+      # Install for this user without questions, start in the background (as at sign-in), check one copy runs,
+      # ask it to exit (as the installer does), then uninstall. Nothing may be left in Program Files or need admin rights.
+      - name: Installer test (informational)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem publish/installer -Filter 'EKrecorder-Setup-*.exe' | Select-Object -First 1).FullName
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER' -PassThru -Wait
+          Write-Host "Setup exit code: $($p.ExitCode)"
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\EKrecorder\EKrecorder.exe'
+          Write-Host "Installed at $installed : $(Test-Path $installed)"
+          $uninstallKey = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' | Where-Object { $_.PSChildName -like '*7C1F0E2A*' }
+          Write-Host "Listed in Installed apps (per user): $([bool]$uninstallKey) $($uninstallKey.GetValue('DisplayName')) $($uninstallKey.GetValue('DisplayVersion'))"
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\EKrecorder.lnk'
+          Write-Host "Start menu shortcut: $(Test-Path $shortcut)"
+          Start-Process -FilePath $installed -ArgumentList '--background'
+          Start-Sleep -Seconds 5
+          $running = @(Get-Process -Name EKrecorder -ErrorAction SilentlyContinue)
+          Write-Host "Running after --background: $($running.Count) process(es)"
+          Start-Process -FilePath $installed -ArgumentList '--background' -Wait
+          $running = @(Get-Process -Name EKrecorder -ErrorAction SilentlyContinue)
+          Write-Host "After a second start: $($running.Count) process(es) (one copy only)"
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name EKrecorder -ErrorAction SilentlyContinue
+          Write-Host "Start with Windows: $($run.EKrecorder)"
+          $e = Start-Process -FilePath $installed -ArgumentList '--exit' -PassThru -Wait
+          Start-Sleep -Seconds 1
+          $running = @(Get-Process -Name EKrecorder -ErrorAction SilentlyContinue)
+          Write-Host "After --exit (exit code $($e.ExitCode)): $($running.Count) process(es)"
+          $settings = Join-Path $env:LOCALAPPDATA 'EKrecorder\settings.json'
+          Write-Host "settings.json created: $(Test-Path $settings)"
+          $uninstaller = Join-Path $env:LOCALAPPDATA 'Programs\EKrecorder\unins000.exe'
+          Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          Start-Sleep -Seconds 2
+          Write-Host "After uninstall: program folder exists: $(Test-Path (Split-Path $installed)); Run value: $([bool](Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name EKrecorder -ErrorAction SilentlyContinue))"
+          Write-Host '===== EKrecorder log ====='
+          Get-Content (Join-Path $env:LOCALAPPDATA 'EKrecorder\Logs\EKrecorder.log') -ErrorAction SilentlyContinue | Select-Object -Last 60 | Write-Host
+
+      - name: Upload EKrecorder (portable .exe)
         uses: actions/upload-artifact@v4
         with:
           name: EKrecorder-win-x64
@@ -116,20 +211,32 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload the probe results
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EKrecorder-Setup
+          path: publish/installer/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: probe-results
-          path: ${{ runner.temp }}/probe/
+          name: test-results
+          path: |
+            ${{ runner.temp }}/selftest/
+            ${{ runner.temp }}/crashtest/
+            ${{ runner.temp }}/screenshots/
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload the self-test results
+      - name: Show the self-test logs
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: selftest-results
-          path: ${{ runner.temp }}/selftest/
-          if-no-files-found: ignore
-          retention-days: 14
+        shell: pwsh
+        run: |
+          foreach ($folder in 'selftest', 'crashtest') {
+            Write-Host "===== $folder log ====="
+            Get-ChildItem (Join-Path $env:RUNNER_TEMP "$folder\logs") -Filter *.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-Content $_.FullName | Write-Host }
+          }

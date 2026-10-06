@@ -1,16 +1,24 @@
+using EKrecorder.App;
 using EKrecorder.Diagnostics;
+using EKrecorder.Platform;
 using EKrecorder.Recording;
+using EKrecorder.Shell;
 
 namespace EKrecorder;
 
 /// <summary>
-/// EKrecorder test build (Step 2: the recording engine). Run without arguments for the test window.
-/// <c>--selftest [--output folder]</c> runs the capture test and a 6-second recording on Monitor 1 without questions
-/// and exits with 0 (all passed), 1 (a check or the recording failed), 3 (a test crashed) or 4 (it hung).
+/// EKrecorder starts here. Normally it lives in the notification area (tray); one copy runs per Windows session.
+/// <list type="bullet">
+/// <item>(no arguments): start, or show the Settings window of the copy that is already running.</item>
+/// <item><c>--background</c>: start quietly in the tray (how Windows starts it at sign-in).</item>
+/// <item><c>--exit</c>: ask the running copy to finish any recording and exit (the installer uses this).</item>
+/// <item><c>--selftest [--output folder]</c> and <c>--selftest-record</c>, <c>--selftest-recover</c>,
+/// <c>--screenshot</c>: the build machine's tests (everything under the output folder).</item>
+/// </list>
 /// </summary>
 internal static class Program
 {
-    private static System.Threading.Timer? _watchdog;
+    public const string InstanceName = "EKrecorder";
 
     [STAThread]
     private static int Main(string[] args)
@@ -18,64 +26,129 @@ internal static class Program
         // Must stay first: applies PerMonitorV2 DPI awareness (ApplicationHighDpiMode in the .csproj) before any
         // window exists. Every monitor and overlay coordinate after this is a physical pixel.
         ApplicationConfiguration.Initialize();
+        // The Settings window follows Windows' light or dark mode.
+        Application.SetColorMode(SystemColorMode.System);
 
-        bool selfTest = args.Any(a => string.Equals(a, "--selftest", StringComparison.OrdinalIgnoreCase));
-        string outputRoot = ArgumentValue(args, "--output")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "EKrecorder test results");
+        if (TestMode(args) is { } mode)
+        {
+            return RunSelfTest(mode, args);
+        }
 
-        Log.Start();
-        RecordingFolders folders = selfTest ? RecordingFolders.Under(outputRoot) : RecordingFolders.Default;
-        Log.Info($"EKrecorder starting{(selfTest ? " in self-test mode" : "")}; test results go to {outputRoot}");
-        Log.Info($"Recordings: in progress {folders.InProgress}; finished {folders.Recordings}; reports {folders.Reports}");
+        if (Has(args, "--exit"))
+        {
+            return ExitRunningCopy();
+        }
+
+        bool background = Has(args, "--background");
+        AppPaths paths = AppPaths.ForUser();
+        using SingleInstance? instance = SingleInstance.TryAcquire(InstanceName);
+        if (instance is null)
+        {
+            // Already running: a start from the Start menu shows its Settings; a second start at sign-in does nothing.
+            if (!background)
+            {
+                SingleInstance.Signal(InstanceName, exit: false);
+            }
+
+            return 0;
+        }
+
+        Log.Start(paths.Logs);
+        Log.Info($"===== EKrecorder starting{(background ? " in the background" : "")}");
         foreach (string line in EnvironmentInfo.Describe())
         {
             Log.Info(line);
         }
 
+        CatchUnhandledExceptions();
+        var store = new SettingsStore(paths.SettingsFile);
+        (AppSettings settings, bool existed, string? problem) = store.Load();
+        if (problem is not null)
+        {
+            Log.Warn(problem);
+        }
+
+        Log.Info($"Data in {paths.Root}; recordings go to {paths.RecordingsFolder(settings)}.");
+        List<Leftover> leftovers = RecoveryService.FindLeftovers(paths);
+        using (var app = new TrayApplication(paths, store, settings, firstRun: !existed, leftovers, instance, showSettings: !background || !existed))
+        {
+            instance.StartListening();
+            Application.Run(app);
+        }
+
+        MediaFoundation.Shutdown();
+        Log.Info("EKrecorder exited.");
+        Log.Stop();
+        return 0;
+    }
+
+    /// <summary>Asks the running EKrecorder to save any recording and exit, and waits for it (at most 3 minutes).</summary>
+    private static int ExitRunningCopy()
+    {
+        if (!SingleInstance.Signal(InstanceName, exit: true))
+        {
+            return 0;
+        }
+
+        return SingleInstance.WaitUntilGone(InstanceName, TimeSpan.FromMinutes(3)) ? 0 : 1;
+    }
+
+    private static int RunSelfTest(string mode, string[] args)
+    {
+        string output = ArgumentValue(args, "--output")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "EKrecorder test results");
+        Log.Start(Path.Combine(output, "logs"));
+        Log.Info($"===== EKrecorder self-test ({mode}); results go to {output}");
+        foreach (string line in EnvironmentInfo.Describe())
+        {
+            Log.Info(line);
+        }
+
+        CatchUnhandledExceptions();
+        using var watchdog = new System.Threading.Timer(
+            _ =>
+            {
+                Log.Error("Self-test watchdog: no result after 8 minutes; exiting.");
+                Log.Stop();
+                Environment.Exit(4);
+            },
+            null,
+            mode == "record" ? Timeout.InfiniteTimeSpan : TimeSpan.FromMinutes(8),
+            Timeout.InfiniteTimeSpan);
+
+        int exitCode;
+        using (var test = new SelfTest(mode, output))
+        {
+            Application.Run(test);
+            exitCode = test.ExitCode;
+        }
+
+        MediaFoundation.Shutdown();
+        Log.Info($"Exiting with code {exitCode}.");
+        Log.Stop();
+        return exitCode;
+    }
+
+    private static void CatchUnhandledExceptions()
+    {
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-        Application.ThreadException += (_, e) => Log.Error("Unhandled exception on the UI thread", e.Exception);
+        Application.ThreadException += (_, e) => Log.Error("Unhandled exception on the window thread", e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Log.Error("Unhandled exception", e.ExceptionObject as Exception);
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
             Log.Error("Unobserved task exception", e.Exception);
             e.SetObserved();
         };
-
-        if (ArgumentValue(args, "--probe") is { } probeFolder)
-        {
-            int probeCode = EncoderProbe.Run(probeFolder);
-            MediaFoundation.Shutdown();
-            Log.Stop();
-            return probeCode;
-        }
-
-        if (selfTest)
-        {
-            _watchdog = new System.Threading.Timer(
-                _ =>
-                {
-                    Log.Error("Self-test watchdog: no result after 3 minutes; exiting.");
-                    Log.Stop();
-                    Environment.Exit(4);
-                },
-                null,
-                TimeSpan.FromMinutes(3),
-                Timeout.InfiniteTimeSpan);
-        }
-
-        int exitCode;
-        using (var form = new SpikeForm(selfTest, outputRoot, folders))
-        {
-            Application.Run(form);
-            exitCode = form.ExitCode;
-        }
-
-        _watchdog?.Dispose();
-        MediaFoundation.Shutdown();
-        Log.Info($"Exiting with code {exitCode}.");
-        Log.Stop();
-        return exitCode;
     }
+
+    private static string? TestMode(string[] args) =>
+        Has(args, "--selftest") ? "full"
+        : Has(args, "--selftest-record") ? "record"
+        : Has(args, "--selftest-recover") ? "recover"
+        : Has(args, "--screenshot") ? "screenshot"
+        : null;
+
+    private static bool Has(string[] args, string name) => args.Any(a => string.Equals(a, name, StringComparison.OrdinalIgnoreCase));
 
     private static string? ArgumentValue(string[] args, string name)
     {

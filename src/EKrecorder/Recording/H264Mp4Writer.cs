@@ -27,9 +27,15 @@ internal sealed record EncoderInfo(
 /// <summary>
 /// H.264 video and AAC audio in MP4 through the Media Foundation sink writer. <see cref="Create"/> either allows
 /// hardware video encoders (the sink writer then loads one if the PC has one) or uses the software encoder only.
-/// Rate control is tried in order: peak-constrained VBR (2 Mbps average, 6 Mbps peak), unconstrained VBR, CBR, then
-/// the same on Main profile, then encoder defaults. Audio is AAC-LC, 48 kHz stereo, 128 kbps; if the AAC encoder
-/// cannot be set up the file is written without audio and <see cref="AudioError"/> says why.
+/// Rate control is tried in order: peak-constrained VBR (the preset's average and peak), unconstrained VBR, CBR, then
+/// the same on Main profile, then encoder defaults; each first without B-frames (the picture order then never needs
+/// a correction), then as the encoder likes. Audio is AAC-LC, 48 kHz stereo at the preset's bitrate; if the AAC
+/// encoder cannot be set up the file is written without audio and <see cref="AudioError"/> says why.
+/// <para>
+/// The file is a fragmented MP4 when asked (Windows writes a fragment about every 0.3 s, so a crash or power cut
+/// loses only the last moments; <see cref="Mp4.Mp4Repair"/> turns it into a regular MP4 afterwards), else a
+/// regular MP4, whose index is only written when the file is finished.
+/// </para>
 /// <para>
 /// Video and audio arrive from different threads. Every call into the sink writer is serialized here, and the sink
 /// writer's throttling is off: otherwise it may hold the video thread until the (deliberately later) audio catches
@@ -49,13 +55,18 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     private readonly uint _audioStream;
     private IMFSinkWriter* _writer;
 
-    private H264Mp4Writer(IMFSinkWriter* writer, uint stream, uint audioStream, string inputType)
+    private H264Mp4Writer(IMFSinkWriter* writer, uint stream, uint audioStream, string inputType, bool fragmented, int audioBitrate)
     {
         _writer = writer;
         _stream = stream;
         _audioStream = audioStream;
         InputType = inputType;
+        IsFragmented = fragmented;
+        AudioFormat = AudioFormatFor(audioBitrate);
     }
+
+    /// <summary>True when the file is a fragmented (crash-safe) MP4.</summary>
+    public bool IsFragmented { get; }
 
     /// <summary>True when the file has an AAC audio track.</summary>
     public bool HasAudio => _audioStream != NoStream;
@@ -63,7 +74,9 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     /// <summary>Why the file has no audio track, when audio was wanted but the AAC encoder could not be set up.</summary>
     public string? AudioError { get; private set; }
 
-    public static string AudioFormat => "AAC-LC, 48000 Hz, stereo, 128 kbps";
+    public string AudioFormat { get; }
+
+    public static string AudioFormatFor(int bitrate) => $"AAC-LC, 48000 Hz, stereo, {bitrate / 1000} kbps";
 
     public EncoderInfo Encoder { get; private set; } = new(false, "unknown", "unknown", "", "", "", "", "", "", "");
 
@@ -116,13 +129,16 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     /// encoder then uses its own GPU device). <paramref name="gpuInput"/>: frames will arrive as GPU textures.
     /// <paramref name="hardwareAllowed"/>: false uses the Microsoft software encoder only.
     /// <paramref name="withAudio"/>: add the AAC track (dropped, with <see cref="AudioError"/>, if it cannot be set up).
+    /// <paramref name="fragmented"/>: write a fragmented (crash-safe) MP4.
+    /// <paramref name="forceBFrames"/> (tests only): ask for exactly this many B-frames.
     /// </summary>
     public static H264Mp4Writer Create(
-        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter, bool withAudio, bool fragmented = false)
+        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter, bool withAudio,
+        bool fragmented = false, int? forceBFrames = null)
     {
         var failures = new List<string>();
         string? audioError = null;
-        foreach (Plan plan in Plans(preset))
+        foreach (Plan plan in Plans(preset, forceBFrames))
         {
             H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, withAudio, fragmented, out string failure, out bool audioFailed);
             if (writer is null && withAudio && audioFailed)
@@ -354,16 +370,31 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
     }
 
-    private static IEnumerable<Plan> Plans(RecordingPreset preset)
+    private static IEnumerable<Plan> Plans(RecordingPreset preset, int? forceBFrames)
     {
         string average = (preset.AverageBitrate / 1e6).ToString("0.#", CultureInfo.InvariantCulture);
         string peak = (preset.PeakBitrate / 1e6).ToString("0.#", CultureInfo.InvariantCulture);
-        yield return new Plan($"High profile, peak-constrained VBR {average}/{peak} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_High, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_PeakConstrainedVBR, true, true);
-        yield return new Plan($"High profile, unconstrained VBR {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_High, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_UnconstrainedVBR, false, true);
-        yield return new Plan($"High profile, CBR {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_High, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_CBR, false, true);
-        yield return new Plan($"Main profile, peak-constrained VBR {average}/{peak} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_Main, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_PeakConstrainedVBR, true, true);
-        yield return new Plan($"Main profile, unconstrained VBR {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_Main, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_UnconstrainedVBR, false, true);
-        yield return new Plan($"Main profile, encoder defaults at {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_Main, null, false, false);
+        var rateControl = new (string Name, eAVEncH264VProfile Profile, eAVEncCommonRateControlMode Mode, bool Peak)[]
+        {
+            ($"High profile, peak-constrained VBR {average}/{peak} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_High, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_PeakConstrainedVBR, true),
+            ($"High profile, unconstrained VBR {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_High, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_UnconstrainedVBR, false),
+            ($"High profile, CBR {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_High, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_CBR, false),
+            ($"Main profile, peak-constrained VBR {average}/{peak} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_Main, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_PeakConstrainedVBR, true),
+            ($"Main profile, unconstrained VBR {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_Main, eAVEncCommonRateControlMode.eAVEncCommonRateControlMode_UnconstrainedVBR, false),
+        };
+
+        // Without B-frames first; an encoder that refuses that setting is used with its own choice.
+        int?[] bFrameChoices = forceBFrames is { } forced ? [forced] : [0, null];
+        foreach (int? bFrames in bFrameChoices)
+        {
+            string suffix = bFrames is { } b ? $", {b} B-frames" : "";
+            foreach ((string name, eAVEncH264VProfile profile, eAVEncCommonRateControlMode mode, bool usePeak) in rateControl)
+            {
+                yield return new Plan(name + suffix, profile, mode, usePeak, true, bFrames);
+            }
+        }
+
+        yield return new Plan($"Main profile, encoder defaults at {average} Mbps", eAVEncH264VProfile.eAVEncH264VProfile_Main, null, false, false, null);
     }
 
     private static H264Mp4Writer? TryCreate(
@@ -432,9 +463,9 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             {
                 try
                 {
-                    audioOutputType = CreateAudioType(in MFAudioFormat.MFAudioFormat_AAC, aac: true);
+                    audioOutputType = CreateAudioType(in MFAudioFormat.MFAudioFormat_AAC, aac: true, preset.AudioBitrate);
                     Check(writer->AddStream(audioOutputType, &audioStream), "IMFSinkWriter::AddStream(AAC)");
-                    audioInputType = CreateAudioType(in MFAudioFormat.MFAudioFormat_PCM, aac: false);
+                    audioInputType = CreateAudioType(in MFAudioFormat.MFAudioFormat_PCM, aac: false, preset.AudioBitrate);
                     Check(writer->SetInputMediaType(audioStream, audioInputType, null), "IMFSinkWriter::SetInputMediaType(PCM to AAC)");
                 }
                 catch (MediaFoundationException)
@@ -445,9 +476,9 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             }
 
             Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
-            Log.Info($"Sink writer ready: {plan.Name}, {(hardware ? "hardware encoders allowed" : "software only")}, {(gpuInput ? "GPU textures in" : "memory frames in")}{(withAudio ? $", audio {AudioFormat}" : ", no audio")}");
+            Log.Info($"Sink writer ready: {plan.Name}, {(hardware ? "hardware encoders allowed" : "software only")}, {(gpuInput ? "GPU textures in" : "memory frames in")}{(withAudio ? $", audio {AudioFormatFor(preset.AudioBitrate)}" : ", no audio")}, {(fragmented ? "fragmented (crash-safe) MP4" : "regular MP4")}");
             Log.Info($"Input media type: {inputDescription}");
-            var result = new H264Mp4Writer(writer, stream, audioStream, inputDescription);
+            var result = new H264Mp4Writer(writer, stream, audioStream, inputDescription, fragmented, preset.AudioBitrate);
             writer = null;
             return result;
         }
@@ -497,8 +528,8 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
     }
 
-    /// <summary>48 kHz stereo audio: AAC-LC at 128 kbps (the file's track), or 16-bit PCM (what the mixer delivers).</summary>
-    private static IMFMediaType* CreateAudioType(in Guid subtype, bool aac)
+    /// <summary>48 kHz stereo audio: AAC-LC at <paramref name="bitrate"/> (the file's track), or 16-bit PCM (what the mixer delivers).</summary>
+    private static IMFMediaType* CreateAudioType(in Guid subtype, bool aac, int bitrate)
     {
         IMFMediaType* type;
         Check(MFCreateMediaType(&type), "MFCreateMediaType(audio)");
@@ -511,7 +542,7 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_NUM_CHANNELS), 2), "set MF_MT_AUDIO_NUM_CHANNELS");
             if (aac)
             {
-                Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_AVG_BYTES_PER_SECOND), 16_000), "set MF_MT_AUDIO_AVG_BYTES_PER_SECOND");
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_AVG_BYTES_PER_SECOND), (uint)(bitrate / 8)), "set MF_MT_AUDIO_AVG_BYTES_PER_SECOND");
                 Check(type->SetUINT32(Ptr(in MF.MF_MT_AAC_PAYLOAD_TYPE), 0), "set MF_MT_AAC_PAYLOAD_TYPE");
                 Check(type->SetUINT32(Ptr(in MF.MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION), 0x29), "set MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION");
             }
@@ -549,6 +580,11 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             }
 
             Check(settings->SetUINT32(__uuidof<CODECAPI_AVEncMPVGOPSize>(), (uint)preset.KeyframeIntervalFrames), "set CODECAPI_AVEncMPVGOPSize");
+            if (plan.BFrames is { } bFrames)
+            {
+                Check(settings->SetUINT32(__uuidof<CODECAPI_AVEncMPVDefaultBPictureCount>(), (uint)bFrames), "set CODECAPI_AVEncMPVDefaultBPictureCount");
+            }
+
             return settings;
         }
         catch
@@ -774,5 +810,5 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
     }
 
-    private sealed record Plan(string Name, eAVEncH264VProfile Profile, eAVEncCommonRateControlMode? RateControl, bool UsePeakBitrate, bool UseEncoderSettings);
+    private sealed record Plan(string Name, eAVEncH264VProfile Profile, eAVEncCommonRateControlMode? RateControl, bool UsePeakBitrate, bool UseEncoderSettings, int? BFrames);
 }

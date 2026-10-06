@@ -10,14 +10,16 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The audio timing code and the output-size rule have no Windows dependencies, so they are compiled
-         straight into the tests, which then run on any OS. -->
+    <!-- The audio timing code, the quality steps, the MP4 conversion and the app's rules (settings, shortcuts,
+         disk space, warnings, journals) have no Windows dependencies, so they are compiled straight into the tests,
+         which then run on any OS. -->
     <Compile Include="..\..\src\EKrecorder\Audio\AudioTimeline.cs" Link="Linked\AudioTimeline.cs" />
     <Compile Include="..\..\src\EKrecorder\Audio\TimelineWriter.cs" Link="Linked\TimelineWriter.cs" />
     <Compile Include="..\..\src\EKrecorder\Audio\SampleConverter.cs" Link="Linked\SampleConverter.cs" />
     <Compile Include="..\..\src\EKrecorder\Audio\AudioMix.cs" Link="Linked\AudioMix.cs" />
     <Compile Include="..\..\src\EKrecorder\Recording\RecordingPreset.cs" Link="Linked\RecordingPreset.cs" />
     <Compile Include="..\..\src\EKrecorder\Mp4\*.cs" Link="Linked\Mp4\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\EKrecorder\App\*.cs" Link="Linked\App\%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>

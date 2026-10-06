@@ -15,6 +15,9 @@ internal static class OverlayArt
     /// <summary>"Recording, all healthy" blue. Also used for the Identify badges.</summary>
     public static readonly Color IndicatorBlue = Color.FromArgb(0x1E, 0x6B, 0xFF);
 
+    /// <summary>"Still recording, but something needs attention" orange.</summary>
+    public static readonly Color IndicatorOrange = Color.FromArgb(0xFF, 0x8A, 0x00);
+
     /// <summary>
     /// A right triangle whose right angle is the bottom-right pixel corner; the slanted edge runs from the top-right
     /// corner to the bottom-left corner. The slanted edge is anti-aliased with 4×4 supersampling.

@@ -21,9 +21,18 @@ namespace EKrecorder.Recording;
 /// One recording of one whole monitor: Windows.Graphics.Capture → GPU scaling and NV12 conversion → Media Foundation
 /// H.264 → MP4 in %LocalAppData%\EKrecorder\InProgress.
 /// <para>
-/// Everything runs on one dedicated thread that paces the output at the preset frame rate (15 fps) on the
+/// Everything runs on one dedicated thread that paces the output at the preset frame rate (30 fps) on the
 /// QueryPerformanceCounter clock. Each tick encodes the newest captured frame, or the previous one again when the
 /// screen has not changed, so the file has a constant frame rate.
+/// </para>
+/// <para>
+/// If the monitor disappears (unplugged, switched off, or a DisplayPort monitor going to sleep), the recording goes on:
+/// the last picture holds, the sound keeps recording, and every 2 seconds the same physical monitor (by its stable
+/// identity, never another one) is looked for and picked up again when it is back.
+/// </para>
+/// <para>
+/// The file is a fragmented (crash-safe) MP4 whenever the encoder set-up allows it; a set-up that refuses it is tried
+/// once more with a regular MP4 before the next set-up is tried.
 /// </para>
 /// <para>
 /// Audio (microphone and computer audio, see <see cref="AudioCapture"/>) starts before the video set-up so the
@@ -48,12 +57,15 @@ internal sealed unsafe class RecordingSession
     private const uint RenderTarget = (uint)D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET;
     private static readonly Guid IID_IDirect3DDxgiInterfaceAccess = new("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
 
+    private const long ReacquireInterval = 20_000_000; // look for a lost monitor every 2 s (100-ns units)
+
     private readonly object _frameLock = new();
     private readonly ManualResetEventSlim _firstFrame = new(false);
     private readonly TaskCompletionSource<RecordingSession> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string _borderlessAccess;
     private readonly bool _simulateFirstSetupFailure;
+    private readonly bool _allowFragmented;
     private readonly AudioSelection? _audioSelection;
     private TimelineClock? _audioClock;
     private readonly List<string> _fallbacks = new();
@@ -64,14 +76,20 @@ internal sealed unsafe class RecordingSession
     private int _captureErrors;
     private SizeInt32 _poolSize;
     private IDirect3DDevice? _winrtDevice;
-    private GraphicsCaptureItem? _item; // kept in a field so it (and its Closed handler) lives as long as the recording
+    private GraphicsCaptureItem? _item; // kept in a field so it (and its Closed handler) lives as long as the capture
+    private Direct3D11CaptureFramePool? _pool;
+    private GraphicsCaptureSession? _captureSession;
     private volatile bool _stopRequested;
     private volatile bool _itemClosed;
+    private volatile bool _captureLost;
+    private long _nextReacquire;
 
-    private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio, bool simulateFirstSetupFailure)
+    private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio, bool simulateFirstSetupFailure, bool allowFragmented)
     {
+        _allowFragmented = allowFragmented;
         _audioSelection = audio;
         Monitor = monitor;
+        CurrentMonitor = monitor;
         Preset = preset;
         TemporaryPath = temporaryPath;
         _borderlessAccess = borderlessAccess;
@@ -79,6 +97,21 @@ internal sealed unsafe class RecordingSession
     }
 
     public MonitorInfo Monitor { get; }
+
+    /// <summary>The monitor as it is now (its position and handle change when it comes back or is moved).</summary>
+    public MonitorInfo CurrentMonitor { get; private set; }
+
+    /// <summary>True while the recorded monitor is gone: the last picture holds until it is back.</summary>
+    public bool CaptureLost => _captureLost;
+
+    /// <summary>How often the monitor was lost during the recording.</summary>
+    public int CaptureLosses { get; private set; }
+
+    /// <summary>True when the file is a fragmented (crash-safe) MP4.</summary>
+    public bool IsFragmented { get; private set; }
+
+    /// <summary>The recorded length so far.</summary>
+    public TimeSpan Elapsed => TimeSpan.FromTicks(Preset.FrameTime(Slots));
 
     public RecordingPreset Preset { get; }
 
@@ -161,11 +194,13 @@ internal sealed unsafe class RecordingSession
     /// <paramref name="audio"/>: which microphone and computer audio to record (null: no audio track).
     /// <paramref name="simulateFirstSetupFailure"/> (self-test only) makes the first set-up's first frame fail, to
     /// prove that the next set-up takes over and that the failure is reported.
+    /// <paramref name="allowFragmented"/>: false writes a regular MP4 only (after a fragmented one failed mid-recording).
     /// </summary>
     public static Task<RecordingSession> StartAsync(
-        MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio, bool simulateFirstSetupFailure = false)
+        MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio,
+        bool simulateFirstSetupFailure = false, bool allowFragmented = true)
     {
-        var session = new RecordingSession(monitor, preset, temporaryPath, borderlessAccess, audio, simulateFirstSetupFailure);
+        var session = new RecordingSession(monitor, preset, temporaryPath, borderlessAccess, audio, simulateFirstSetupFailure, allowFragmented);
         var thread = new Thread(session.Run)
         {
             Name = "EKrecorder recording",
@@ -189,8 +224,6 @@ internal sealed unsafe class RecordingSession
         CaptureDevice? device = null;
         IDXGIAdapter3* adapter3 = null;
         Route? route = null;
-        Direct3D11CaptureFramePool? pool = null;
-        GraphicsCaptureSession? session = null;
         bool started = false;
         try
         {
@@ -207,21 +240,6 @@ internal sealed unsafe class RecordingSession
             EnableMultithreadProtection(d3dDevice);
             adapter3 = TryGetAdapter3(d3dDevice);
 
-            GraphicsCaptureItem item = CaptureItemFactory.CreateForMonitor(Monitor.Handle);
-            _item = item;
-            item.Closed += (_, _) =>
-            {
-                StopReason ??= "the monitor was disconnected or switched off";
-                _itemClosed = true;
-                Log.Warn("GraphicsCaptureItem.Closed: the monitor is gone; the recording stops and is saved.");
-            };
-            _poolSize = item.Size;
-            CaptureSize = new Size(item.Size.Width, item.Size.Height);
-            OutputSize = Preset.OutputSizeFor(CaptureSize);
-            Log.Decision($"Output size {OutputSize.Width}x{OutputSize.Height} for a {CaptureSize.Width}x{CaptureSize.Height} monitor "
-                + (OutputSize == CaptureSize ? "(no scaling)." : "(scaled down, aspect ratio kept, never upscaled)."));
-
-            HardwareEncoders = H264Mp4Writer.ListHardwareEncoders();
             if (_audioSelection is not null)
             {
                 // The devices open in the background while the video is set up (a Bluetooth headset can take a while).
@@ -229,11 +247,13 @@ internal sealed unsafe class RecordingSession
                 Audio.Start();
             }
 
-            pool = Direct3D11CaptureFramePool.CreateFreeThreaded(device.Device, DirectXPixelFormat.B8G8R8A8UIntNormalized, PoolBuffers, item.Size);
-            session = pool.CreateCaptureSession(item);
-            CaptureSettings = CaptureSessionSetup.Configure(session, Preset.FramesPerSecond, _borderlessAccess).Describe();
-            pool.FrameArrived += OnFrameArrived;
-            session.StartCapture();
+            StartCapture(Monitor);
+            CaptureSize = new Size(_poolSize.Width, _poolSize.Height);
+            OutputSize = Preset.OutputSizeFor(CaptureSize);
+            Log.Decision($"Output size {OutputSize.Width}x{OutputSize.Height} for a {CaptureSize.Width}x{CaptureSize.Height} monitor "
+                + (OutputSize == CaptureSize ? "(no scaling)." : "(scaled down, aspect ratio kept, never upscaled)."));
+
+            HardwareEncoders = H264Mp4Writer.ListHardwareEncoders();
             Log.Info("Capture started; waiting for the first frame.");
             if (!_firstFrame.Wait(TimeSpan.FromSeconds(5)))
             {
@@ -271,23 +291,9 @@ internal sealed unsafe class RecordingSession
                 Stats.EndTimestamp = Stopwatch.GetTimestamp();
             }
 
-            // Stop the capture first, then let go of the frame we hold. Cleanup must never throw, or the window
-            // would wait for this recording forever.
-            try
-            {
-                if (pool != null)
-                {
-                    pool.FrameArrived -= OnFrameArrived;
-                }
-
-                session?.Dispose();
-                pool?.Dispose();
-            }
-            catch (Exception ex)
-            {
-                Log.Error("Stopping the capture failed", ex);
-            }
-
+            // Stop the capture first, then let go of the frame we hold. Cleanup must never throw, or the app would
+            // wait for this recording forever.
+            StopCapture();
             lock (_frameLock)
             {
                 _captureClosed = true;
@@ -323,7 +329,6 @@ internal sealed unsafe class RecordingSession
                 Log.Error("Releasing the capture device failed", ex);
             }
 
-            _item = null;
             if (!FileFinalized && Stats.FramesWritten == 0)
             {
                 TryDelete(TemporaryPath);
@@ -342,21 +347,26 @@ internal sealed unsafe class RecordingSession
     /// </summary>
     private Route OpenRoute(CaptureDevice device, ID3D11Device* d3dDevice, out long firstFrameWritten)
     {
-        var setups = new List<(string Name, Func<Route?> Open)>();
+        var setups = new List<(string Name, Func<bool, Route?> Open)>();
         if (device.HasVideoSupport)
         {
-            setups.Add((GpuSetup, () => TryOpenGpuRoute(device, d3dDevice)));
+            setups.Add((GpuSetup, fragmented => TryOpenGpuRoute(device, d3dDevice, fragmented)));
         }
         else
         {
             Fallback(GpuSetup, "this GPU device has no Direct3D 11 video support");
         }
 
-        setups.Add((CpuHardwareSetup, () => OpenCpuRoute(device, d3dDevice, hardware: true)));
-        setups.Add((CpuSoftwareSetup, () => OpenCpuRoute(device, d3dDevice, hardware: false)));
+        setups.Add((CpuHardwareSetup, fragmented => OpenCpuRoute(device, d3dDevice, hardware: true, fragmented)));
+        setups.Add((CpuSoftwareSetup, fragmented => OpenCpuRoute(device, d3dDevice, hardware: false, fragmented)));
 
+        // Each set-up first with the crash-safe fragmented MP4, then with a regular MP4: the way frames reach the
+        // encoder matters more than the container.
+        bool[] containers = _allowFragmented ? [true, false] : [false];
+        var attempts = setups.SelectMany(setup => containers.Select(fragmented =>
+            (Name: fragmented ? setup.Name : $"{setup.Name} (regular MP4)", Open: (Func<Route?>)(() => setup.Open(fragmented))))).ToList();
         bool simulate = _simulateFirstSetupFailure;
-        foreach ((string name, Func<Route?> open) in setups)
+        foreach ((string name, Func<Route?> open) in attempts)
         {
             Log.Info($"Trying {name}.");
             Route? route;
@@ -398,6 +408,7 @@ internal sealed unsafe class RecordingSession
 
                 FramePath = route.Describe();
                 UsesGpuPath = route.Gpu is not null;
+                IsFragmented = route.Writer.IsFragmented;
                 Encoder = route.Writer.Encoder;
                 ConverterDescription = route.ConverterDescription;
                 EncoderInputType = route.Writer.InputType;
@@ -498,7 +509,7 @@ internal sealed unsafe class RecordingSession
     }
 
     /// <summary>GPU frames into a hardware encoder, or null (with the reason in <see cref="Fallbacks"/>).</summary>
-    private Route? TryOpenGpuRoute(CaptureDevice device, ID3D11Device* d3dDevice)
+    private Route? TryOpenGpuRoute(CaptureDevice device, ID3D11Device* d3dDevice, bool fragmented)
     {
         IMFDXGIDeviceManager* manager = TryCreateDeviceManager(d3dDevice);
         if (manager == null)
@@ -519,7 +530,7 @@ internal sealed unsafe class RecordingSession
                 return null;
             }
 
-            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter, withAudio: Audio is not null);
+            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter, withAudio: Audio is not null, fragmented);
             if (!writer.Encoder.IsHardware)
             {
                 Fallback(GpuSetup, "no hardware encoder accepted the settings (GPU frames are only used with a hardware encoder)");
@@ -554,13 +565,13 @@ internal sealed unsafe class RecordingSession
     }
 
     /// <summary>CPU frames into the encoder; a hardware one when allowed and available, else the software one.</summary>
-    private Route OpenCpuRoute(CaptureDevice device, ID3D11Device* d3dDevice, bool hardware)
+    private Route OpenCpuRoute(CaptureDevice device, ID3D11Device* d3dDevice, bool hardware, bool fragmented)
     {
         var cpu = new CpuFrameConverter(d3dDevice, OutputSize);
         try
         {
             // No device manager: a hardware encoder then takes frames from memory and runs on its own GPU device.
-            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter, withAudio: Audio is not null);
+            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter, withAudio: Audio is not null, fragmented);
             var route = new Route(hardware ? CpuHardwareSetup : CpuSoftwareSetup, writer, null, null, cpu, null);
             cpu = null;
             return route;
@@ -723,7 +734,7 @@ internal sealed unsafe class RecordingSession
         int lateWarnings = 0;
         try
         {
-            while (!_stopRequested && !_itemClosed)
+            while (!_stopRequested)
             {
                 long due = start + (slot * frequency / fps);
                 timer.WaitUntil(due);
@@ -757,6 +768,15 @@ internal sealed unsafe class RecordingSession
                 {
                     nextResourceSample = slot + (2 * fps);
                     SampleResources(adapter3);
+                }
+
+                if (_itemClosed && !_captureLost)
+                {
+                    OnCaptureLost();
+                }
+                else if (_captureLost && TimelineClock.NowHns() >= _nextReacquire)
+                {
+                    TryReacquire();
                 }
             }
         }
@@ -890,6 +910,119 @@ internal sealed unsafe class RecordingSession
         {
             target->Release();
             sample->Release();
+        }
+    }
+
+    /// <summary>Starts capturing <paramref name="monitor"/> on this recording's GPU device.</summary>
+    private void StartCapture(MonitorInfo monitor)
+    {
+        GraphicsCaptureItem item = CaptureItemFactory.CreateForMonitor(monitor.Handle);
+        Direct3D11CaptureFramePool? pool = null;
+        GraphicsCaptureSession? session = null;
+        try
+        {
+            item.Closed += OnItemClosed;
+            pool = Direct3D11CaptureFramePool.CreateFreeThreaded(_winrtDevice!, DirectXPixelFormat.B8G8R8A8UIntNormalized, PoolBuffers, item.Size);
+            session = pool.CreateCaptureSession(item);
+            CaptureSettings = CaptureSessionSetup.Configure(session, Preset.FramesPerSecond, _borderlessAccess).Describe();
+            _poolSize = item.Size;
+            pool.FrameArrived += OnFrameArrived;
+            session.StartCapture();
+            _item = item;
+            _pool = pool;
+            _captureSession = session;
+        }
+        catch
+        {
+            item.Closed -= OnItemClosed;
+            if (pool is not null)
+            {
+                pool.FrameArrived -= OnFrameArrived;
+            }
+
+            session?.Dispose();
+            pool?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Stops the capture (never throws). The frame already held stays usable.</summary>
+    private void StopCapture()
+    {
+        try
+        {
+            if (_pool is not null)
+            {
+                _pool.FrameArrived -= OnFrameArrived;
+            }
+
+            if (_item is not null)
+            {
+                _item.Closed -= OnItemClosed;
+            }
+
+            _captureSession?.Dispose();
+            _pool?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Stopping the capture failed", ex);
+        }
+
+        _captureSession = null;
+        _pool = null;
+        _item = null;
+    }
+
+    private void OnItemClosed(GraphicsCaptureItem sender, object args)
+    {
+        _itemClosed = true;
+        Log.Warn("GraphicsCaptureItem.Closed: the recorded monitor is gone (unplugged, switched off or asleep).");
+    }
+
+    /// <summary>The monitor is gone: the recording goes on with the last picture, and the monitor is looked for.</summary>
+    private void OnCaptureLost()
+    {
+        _captureLost = true;
+        CaptureLosses++;
+        Stats.AddError("The recorded monitor disappeared; the picture held its last frame until it was back. Sound kept recording.");
+        Log.Decision($"{Monitor.Name} ({Monitor.FriendlyName}) is gone. Recording goes on with the last picture; looking for the same monitor every 2 s.");
+        StopCapture();
+        _nextReacquire = TimelineClock.NowHns() + (ReacquireInterval / 2);
+    }
+
+    /// <summary>Looks for the same physical monitor (by its stable identity) and captures it again if it is back.</summary>
+    private void TryReacquire()
+    {
+        _nextReacquire = TimelineClock.NowHns() + ReacquireInterval;
+        MonitorInfo? monitor;
+        try
+        {
+            monitor = MonitorEnumerator.GetMonitors(log: false).FirstOrDefault(m => m.StableId == Monitor.StableId);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Looking for the recorded monitor failed", ex);
+            return;
+        }
+
+        if (monitor is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _itemClosed = false;
+            StartCapture(monitor);
+            CurrentMonitor = monitor;
+            _captureLost = false;
+            Log.Info($"The recorded monitor is back: {monitor.Summary}. Capturing it again.");
+        }
+        catch (Exception ex)
+        {
+            StopCapture();
+            Log.Error($"{monitor.Name} is back but could not be captured yet; trying again in 2 s", ex);
         }
     }
 

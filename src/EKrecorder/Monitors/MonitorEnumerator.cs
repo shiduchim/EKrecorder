@@ -7,7 +7,8 @@ namespace EKrecorder.Monitors;
 /// <summary>Finds the connected monitors and numbers them left to right.</summary>
 internal static class MonitorEnumerator
 {
-    public static IReadOnlyList<MonitorInfo> GetMonitors()
+    /// <param name="log">False for a quiet look (a lost monitor is looked for every 2 s).</param>
+    public static IReadOnlyList<MonitorInfo> GetMonitors(bool log = true)
     {
         var handles = new List<IntPtr>();
         bool enumerated = Win32.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (monitor, _, _, _) =>
@@ -15,23 +16,34 @@ internal static class MonitorEnumerator
             handles.Add(monitor);
             return true;
         }, IntPtr.Zero);
-        Log.Api("EnumDisplayMonitors", enumerated, $"{handles.Count} monitor(s)");
+        if (log)
+        {
+            Log.Api("EnumDisplayMonitors", enumerated, $"{handles.Count} monitor(s)");
+        }
 
-        Dictionary<string, (string FriendlyName, string DevicePath)> names = ReadDisplayConfigNames();
+        Dictionary<string, (string FriendlyName, string DevicePath)> names = ReadDisplayConfigNames(log);
         var found = new List<MonitorInfo>();
         foreach (IntPtr handle in handles)
         {
             var info = new Win32.MONITORINFOEX { cbSize = Marshal.SizeOf<Win32.MONITORINFOEX>() };
             if (!Win32.GetMonitorInfo(handle, ref info))
             {
-                Log.Api($"GetMonitorInfo(0x{handle:X})", false, Win32.LastErrorText());
+                if (log)
+                {
+                    Log.Api($"GetMonitorInfo(0x{handle:X})", false, Win32.LastErrorText());
+                }
+
                 continue;
             }
 
             int hr = Win32.GetDpiForMonitor(handle, Win32.MDT_EFFECTIVE_DPI, out uint dpi, out _);
             if (hr < 0 || dpi == 0)
             {
-                Log.Api($"GetDpiForMonitor({info.szDevice})", false, $"{Win32.Hr(hr)}; using 96 DPI");
+                if (log)
+                {
+                    Log.Api($"GetDpiForMonitor({info.szDevice})", false, $"{Win32.Hr(hr)}; using 96 DPI");
+                }
+
                 dpi = 96;
             }
 
@@ -40,7 +52,7 @@ internal static class MonitorEnumerator
             // The monitor's device path survives reboots and resolution changes; it is the identity to remember.
             string stableId = !string.IsNullOrEmpty(name.DevicePath)
                 ? name.DevicePath
-                : DeviceInterfacePath(info.szDevice) ?? info.szDevice;
+                : DeviceInterfacePath(info.szDevice, log) ?? info.szDevice;
 
             found.Add(new MonitorInfo(
                 Number: 0,
@@ -62,7 +74,7 @@ internal static class MonitorEnumerator
             .Select((m, index) => m with { Number = index + 1 })
             .ToList();
 
-        foreach (MonitorInfo monitor in ordered)
+        foreach (MonitorInfo monitor in ordered.Where(_ => log))
         {
             Log.Info($"{monitor.Summary}; {monitor.GdiDeviceName}; HMONITOR 0x{monitor.Handle:X}; work area {monitor.WorkArea}; id {monitor.StableId}");
         }
@@ -74,7 +86,7 @@ internal static class MonitorEnumerator
     /// Maps each GDI device name (\\.\DISPLAY1) to the monitor's friendly name and device path through the
     /// display-configuration API. Returns an empty map if that API fails; callers fall back to EnumDisplayDevices.
     /// </summary>
-    private static Dictionary<string, (string FriendlyName, string DevicePath)> ReadDisplayConfigNames()
+    private static Dictionary<string, (string FriendlyName, string DevicePath)> ReadDisplayConfigNames(bool log)
     {
         var result = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
         try
@@ -87,7 +99,11 @@ internal static class MonitorEnumerator
                 error = Win32.GetDisplayConfigBufferSizes(Win32.QDC_ONLY_ACTIVE_PATHS, out uint pathCount, out uint modeCount);
                 if (error != Win32.ERROR_SUCCESS)
                 {
-                    Log.Api("GetDisplayConfigBufferSizes", false, $"error {error}");
+                    if (log)
+                    {
+                        Log.Api("GetDisplayConfigBufferSizes", false, $"error {error}");
+                    }
+
                     return result;
                 }
 
@@ -104,7 +120,11 @@ internal static class MonitorEnumerator
 
             if (error != Win32.ERROR_SUCCESS)
             {
-                Log.Api("QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)", false, $"error {error}");
+                if (log)
+                {
+                    Log.Api("QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)", false, $"error {error}");
+                }
+
                 return result;
             }
 
@@ -136,14 +156,21 @@ internal static class MonitorEnumerator
 
                 if (sourceError != Win32.ERROR_SUCCESS)
                 {
-                    Log.Api("DisplayConfigGetDeviceInfo(GET_SOURCE_NAME)", false, $"error {sourceError}");
+                    if (log)
+                    {
+                        Log.Api("DisplayConfigGetDeviceInfo(GET_SOURCE_NAME)", false, $"error {sourceError}");
+                    }
+
                     continue;
                 }
 
                 string friendly = targetError == Win32.ERROR_SUCCESS ? target.monitorFriendlyDeviceName ?? "" : "";
                 string devicePath = targetError == Win32.ERROR_SUCCESS ? target.monitorDevicePath ?? "" : "";
-                Log.Api($"DisplayConfigGetDeviceInfo({source.viewGdiDeviceName})", targetError == Win32.ERROR_SUCCESS,
-                    targetError == Win32.ERROR_SUCCESS ? $"\"{friendly}\" {devicePath}" : $"target name error {targetError}");
+                if (log)
+                {
+                    Log.Api($"DisplayConfigGetDeviceInfo({source.viewGdiDeviceName})", targetError == Win32.ERROR_SUCCESS,
+                        targetError == Win32.ERROR_SUCCESS ? $"\"{friendly}\" {devicePath}" : $"target name error {targetError}");
+                }
 
                 // In duplicate (clone) mode one source has several targets; the first one names it.
                 result.TryAdd(source.viewGdiDeviceName, (friendly, devicePath));
@@ -157,12 +184,15 @@ internal static class MonitorEnumerator
         return result;
     }
 
-    private static string? DeviceInterfacePath(string gdiDeviceName)
+    private static string? DeviceInterfacePath(string gdiDeviceName, bool log)
     {
         var device = new Win32.DISPLAY_DEVICE { cb = Marshal.SizeOf<Win32.DISPLAY_DEVICE>() };
         bool ok = Win32.EnumDisplayDevices(gdiDeviceName, 0, ref device, Win32.EDD_GET_DEVICE_INTERFACE_NAME);
-        Log.Api($"EnumDisplayDevices({gdiDeviceName}, EDD_GET_DEVICE_INTERFACE_NAME)", ok,
-            ok ? $"\"{device.DeviceString}\" {device.DeviceID}" : "no monitor device");
+        if (log)
+        {
+            Log.Api($"EnumDisplayDevices({gdiDeviceName}, EDD_GET_DEVICE_INTERFACE_NAME)", ok,
+                ok ? $"\"{device.DeviceString}\" {device.DeviceID}" : "no monitor device");
+        }
         return ok && !string.IsNullOrEmpty(device.DeviceID) ? device.DeviceID : null;
     }
 }

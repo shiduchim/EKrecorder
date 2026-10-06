@@ -39,7 +39,13 @@ internal static class MoovBuilder
         return writer.ToArray();
     }
 
-    /// <summary>The edits that keep the track's timeline exactly as the fragments had it.</summary>
+    /// <summary>
+    /// The edits that keep the track's timeline as the fragments had it: a track whose first fragment starts after 0
+    /// gets an empty edit for that delay, and an edit list the recording already had is kept. Without one, an
+    /// encoder's reordering delay (B-frames: the first picture is shown a frame or two after its decode time) is
+    /// removed with an edit that starts the track at its first picture, the way MP4 muxers normally do it, so the
+    /// picture is not shown later than the sound recorded with it.
+    /// </summary>
     internal static List<Edit> EditsFor(TrackSamples track, uint movieTimescale)
     {
         var edits = new List<Edit>();
@@ -53,9 +59,11 @@ internal static class MoovBuilder
         List<Edit> original = ReadEdits(track.Header.Edts);
         if (original.Count == 0)
         {
-            if (start > 0)
+            long delay = ReorderingDelay(track);
+            if (start > 0 || delay > 0)
             {
-                edits.Add(new Edit(Rescale((ulong)track.MediaDuration, mediaTimescale, movieTimescale), 0, 0x10000));
+                long shown = Math.Max(0, track.MediaDuration - delay);
+                edits.Add(new Edit(Rescale((ulong)shown, mediaTimescale, movieTimescale), delay, 0x10000));
             }
 
             return edits;
@@ -84,6 +92,28 @@ internal static class MoovBuilder
         }
 
         return edits;
+    }
+
+    /// <summary>
+    /// When the first picture is shown, counted from the first sample's decode time: the smallest presentation time
+    /// among the first samples (reordering never reaches further than a few frames). 0 without composition offsets.
+    /// </summary>
+    internal static long ReorderingDelay(TrackSamples track)
+    {
+        if (!track.AnyCompositionOffset || track.Count == 0)
+        {
+            return 0;
+        }
+
+        long decode = 0;
+        long earliest = long.MaxValue;
+        for (int i = 0; i < track.Count && i < 32; i++)
+        {
+            earliest = Math.Min(earliest, decode + track.CompositionOffsets[i]);
+            decode += track.Durations[i];
+        }
+
+        return Math.Max(0, earliest);
     }
 
     /// <summary>The entries of an edts box (header included), or none.</summary>

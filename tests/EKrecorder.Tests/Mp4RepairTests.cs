@@ -208,6 +208,24 @@ public sealed class Mp4RepairTests : IDisposable
     }
 
     [Fact]
+    public void AnEncoderReorderingDelayIsRemovedWithAnEdit()
+    {
+        // B-frames: the first picture (decode time 0) is shown at 1000 ticks (one frame). The regular file starts
+        // the track at that picture, so it is not shown a frame later than the sound recorded with it.
+        var written = new List<WrittenSample>();
+        string path = Save(new FragmentedMp4Builder().Build(FragmentedMp4Builder.TypicalFragments(4, compositionOffsets: true), written));
+
+        Assert.Equal(RepairOutcome.Converted, Mp4Repair.Run(path).Outcome);
+        using FileStream stream = File.OpenRead(path);
+        (List<TrackTable> tracks, uint movieTimescale, _) = Mp4File.ReadTracks(stream);
+        TrackTable video = tracks.Single(t => t.Handler == "vide");
+        MoovBuilder.Edit edit = Assert.Single(video.Edits);
+        Assert.Equal(1000, edit.MediaTime);
+        Assert.Equal((ulong)((video.MediaDuration - 1000) * movieTimescale / video.Timescale), edit.SegmentDuration);
+        Assert.Empty(tracks.Single(t => t.Handler == "soun").Edits);
+    }
+
+    [Fact]
     public void AnEditListUntilTheEndGetsTheRealLength()
     {
         var builder = new FragmentedMp4Builder { InitEditList = true };

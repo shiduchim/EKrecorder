@@ -13,6 +13,9 @@ internal static class EnvironmentInfo
         typeof(EnvironmentInfo).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
         ?? "unknown";
 
+    /// <summary>"1.0.0" (without the build's commit id), for the Settings window.</summary>
+    public static string ShortVersion => AppVersion.Split('+')[0];
+
     /// <summary>True when the UI thread runs PerMonitorV2, so every coordinate the spike uses is a physical pixel.</summary>
     public static bool IsPerMonitorV2 =>
         Win32.AreDpiAwarenessContextsEqual(Win32.GetThreadDpiAwarenessContext(), Win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
