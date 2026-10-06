@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using EKrecorder.Capture;
 using EKrecorder.Diagnostics;
 using EKrecorder.Monitors;
@@ -21,13 +22,24 @@ namespace EKrecorder.Recording;
 /// <para>
 /// Everything runs on one dedicated thread that paces the output at the preset frame rate (15 fps) on the
 /// QueryPerformanceCounter clock. Each tick encodes the newest captured frame, or the previous one again when the
-/// screen has not changed, so the file has a constant frame rate. Frames stay on the GPU on the normal path.
+/// screen has not changed, so the file has a constant frame rate.
+/// </para>
+/// <para>
+/// How frames reach the encoder is chosen at the start, best first: GPU frames into a hardware encoder (nothing leaves
+/// the GPU), CPU frames into a hardware encoder, CPU frames into the software encoder. The first frame tests each
+/// set-up: if it is refused, the reason and a full description of what was sent go into the report, and the next
+/// set-up is tried.
 /// </para>
 /// </summary>
 internal sealed unsafe class RecordingSession
 {
+    public const string GpuSetup = "GPU frames -> hardware encoder";
+    public const string CpuHardwareSetup = "CPU frames -> hardware encoder";
+    public const string CpuSoftwareSetup = "CPU frames -> software encoder";
+
     private const int PoolBuffers = 3;
     private const int MaxLoggedErrors = 50;
+    private const uint RenderTarget = (uint)D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET;
     private static readonly Guid IID_IDirect3DDxgiInterfaceAccess = new("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
 
     private readonly object _frameLock = new();
@@ -35,10 +47,12 @@ internal sealed unsafe class RecordingSession
     private readonly TaskCompletionSource<RecordingSession> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string _borderlessAccess;
+    private readonly bool _simulateFirstSetupFailure;
+    private readonly List<string> _fallbacks = new();
+    private readonly StringBuilder _setupFailures = new();
     private HeldFrame? _latest;
     private bool _latestUnused;
     private bool _captureClosed;
-    private bool _cpuHasFrame;
     private int _captureErrors;
     private SizeInt32 _poolSize;
     private IDirect3DDevice? _winrtDevice;
@@ -46,12 +60,13 @@ internal sealed unsafe class RecordingSession
     private volatile bool _stopRequested;
     private volatile bool _itemClosed;
 
-    private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess)
+    private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, bool simulateFirstSetupFailure)
     {
         Monitor = monitor;
         Preset = preset;
         TemporaryPath = temporaryPath;
         _borderlessAccess = borderlessAccess;
+        _simulateFirstSetupFailure = simulateFirstSetupFailure;
     }
 
     public MonitorInfo Monitor { get; }
@@ -80,7 +95,31 @@ internal sealed unsafe class RecordingSession
 
     public EncoderInfo? Encoder { get; private set; }
 
-    /// <summary>Output frames written so far (slot count, including skipped ones, decides the duration).</summary>
+    /// <summary>How frames reach the file in this recording, for example "GPU frames (...) -> NVIDIA hardware H.264 encoder".</summary>
+    public string FramePath { get; private set; } = "";
+
+    /// <summary>True when frames stay on the GPU from capture to encoder.</summary>
+    public bool UsesGpuPath { get; private set; }
+
+    /// <summary>Set-ups that were skipped or failed before the one in use, each with the reason.</summary>
+    public IReadOnlyList<string> Fallbacks => _fallbacks;
+
+    /// <summary>Full details of every set-up whose first frame was refused; empty when none was.</summary>
+    public string SetupFailures => _setupFailures.ToString();
+
+    /// <summary>Full details when the encoder failed after the recording had started; empty when it did not.</summary>
+    public string RecordingFailure { get; private set; } = "";
+
+    /// <summary>GPU path: the sample pool's summary (buffer lengths, textures). Empty on the CPU paths.</summary>
+    public string GpuSamples { get; private set; } = "";
+
+    /// <summary>The input media type given to the sink writer.</summary>
+    public string EncoderInputType { get; private set; } = "";
+
+    /// <summary>What the encoder's input stream asks of its samples (IMFTransform::GetInputStreamAttributes).</summary>
+    public string EncoderInputStream { get; private set; } = "";
+
+    /// <summary>Output frames so far (slot count, including dropped ones, decides the duration).</summary>
     public long Slots { get; private set; }
 
     public bool FileFinalized { get; private set; }
@@ -90,10 +129,15 @@ internal sealed unsafe class RecordingSession
     /// <summary>Completes when the recording has stopped and the file is closed (also after a self-stop or error).</summary>
     public Task Completion => _finished.Task;
 
-    /// <summary>Starts recording; returns once the first frame has been captured and the encoder is ready.</summary>
-    public static Task<RecordingSession> StartAsync(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess)
+    /// <summary>
+    /// Starts recording; returns once the first frame has been captured and accepted by the encoder.
+    /// <paramref name="simulateFirstSetupFailure"/> (self-test only) makes the first set-up's first frame fail, to
+    /// prove that the next set-up takes over and that the failure is reported.
+    /// </summary>
+    public static Task<RecordingSession> StartAsync(
+        MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, bool simulateFirstSetupFailure = false)
     {
-        var session = new RecordingSession(monitor, preset, temporaryPath, borderlessAccess);
+        var session = new RecordingSession(monitor, preset, temporaryPath, borderlessAccess, simulateFirstSetupFailure);
         var thread = new Thread(session.Run)
         {
             Name = "EKrecorder recording",
@@ -115,12 +159,8 @@ internal sealed unsafe class RecordingSession
     private void Run()
     {
         CaptureDevice? device = null;
-        IMFDXGIDeviceManager* manager = null;
         IDXGIAdapter3* adapter3 = null;
-        GpuFrameConverter? gpu = null;
-        GpuSamplePool? samples = null;
-        CpuFrameConverter? cpu = null;
-        H264Mp4Writer? writer = null;
+        Route? route = null;
         Direct3D11CaptureFramePool? pool = null;
         GraphicsCaptureSession? session = null;
         bool started = false;
@@ -155,36 +195,6 @@ internal sealed unsafe class RecordingSession
 
             HardwareEncoders = H264Mp4Writer.ListHardwareEncoders();
 
-            if (device.HasVideoSupport)
-            {
-                manager = TryCreateDeviceManager(d3dDevice);
-                if (manager != null)
-                {
-                    gpu = GpuFrameConverter.TryCreate(d3dDevice, CaptureSize, OutputSize, Preset.FramesPerSecond);
-                    if (gpu != null)
-                    {
-                        samples = GpuSamplePool.TryCreate(manager, OutputSize, Preset.FramesPerSecond);
-                        if (samples == null || !CanConvertInto(gpu, samples))
-                        {
-                            samples?.Dispose();
-                            samples = null;
-                            gpu.Dispose();
-                            gpu = null;
-                        }
-                    }
-                }
-            }
-
-            if (gpu == null)
-            {
-                Log.Decision("Scaling and colour conversion fall back to the CPU.");
-                cpu = new CpuFrameConverter(d3dDevice, OutputSize);
-            }
-
-            ConverterDescription = gpu?.Description ?? cpu!.Description;
-            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: gpu != null, device.Adapter);
-            Encoder = writer.Encoder;
-
             pool = Direct3D11CaptureFramePool.CreateFreeThreaded(device.Device, DirectXPixelFormat.B8G8R8A8UIntNormalized, PoolBuffers, item.Size);
             session = pool.CreateCaptureSession(item);
             CaptureSettings = CaptureSessionSetup.Configure(session, Preset.FramesPerSecond, _borderlessAccess).Describe();
@@ -196,9 +206,10 @@ internal sealed unsafe class RecordingSession
                 throw new InvalidOperationException("Windows.Graphics.Capture delivered no frame within 5 seconds.");
             }
 
+            route = OpenRoute(device, d3dDevice, out long firstFrameWritten);
             started = true;
             _started.TrySetResult(this);
-            RunFrames(gpu, samples, cpu, writer, adapter3);
+            RunFrames(route, adapter3, firstFrameWritten);
         }
         catch (Exception ex)
         {
@@ -212,6 +223,10 @@ internal sealed unsafe class RecordingSession
             {
                 Log.Error("The recording stopped because of an error", ex);
                 StopReason ??= "an error (see Errors)";
+                if (route is not null)
+                {
+                    RecordFailureDetails(route, "the recording stopped because of an error", ex);
+                }
             }
         }
         finally
@@ -253,36 +268,9 @@ internal sealed unsafe class RecordingSession
                 _latest = null;
             }
 
-            if (writer != null)
+            if (route != null)
             {
-                WriterStatistics = writer.Statistics();
-                if (Stats.FramesWritten > 0)
-                {
-                    long finalizeStart = Stopwatch.GetTimestamp();
-                    try
-                    {
-                        writer.FinishFile();
-                        FileFinalized = true;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Error("Finishing the MP4 file failed", ex);
-                        Stats.AddError($"Finishing the MP4 file failed: {ex.Message}");
-                    }
-
-                    Stats.FinalizeSeconds = Stopwatch.GetElapsedTime(finalizeStart).TotalSeconds;
-                }
-
-                writer.Dispose();
-            }
-
-            // The encoder is gone now, so every sample is back in the pool.
-            samples?.Dispose();
-            gpu?.Dispose();
-            cpu?.Dispose();
-            if (manager != null)
-            {
-                manager->Release();
+                CloseRoute(route);
             }
 
             if (adapter3 != null)
@@ -311,7 +299,296 @@ internal sealed unsafe class RecordingSession
         }
     }
 
-    private void RunFrames(GpuFrameConverter? gpu, GpuSamplePool? samples, CpuFrameConverter? cpu, H264Mp4Writer writer, IDXGIAdapter3* adapter3)
+    /// <summary>
+    /// Sets up how frames reach the file and writes frame 0, which is the test of the set-up. Tries GPU frames into a
+    /// hardware encoder, then CPU frames into a hardware encoder, then CPU frames into the software encoder. Returns
+    /// the set-up that accepted frame 0 and the time it was written.
+    /// </summary>
+    private Route OpenRoute(CaptureDevice device, ID3D11Device* d3dDevice, out long firstFrameWritten)
+    {
+        var setups = new List<(string Name, Func<Route?> Open)>();
+        if (device.HasVideoSupport)
+        {
+            setups.Add((GpuSetup, () => TryOpenGpuRoute(device, d3dDevice)));
+        }
+        else
+        {
+            Fallback(GpuSetup, "this GPU device has no Direct3D 11 video support");
+        }
+
+        setups.Add((CpuHardwareSetup, () => OpenCpuRoute(device, d3dDevice, hardware: true)));
+        setups.Add((CpuSoftwareSetup, () => OpenCpuRoute(device, d3dDevice, hardware: false)));
+
+        bool simulate = _simulateFirstSetupFailure;
+        foreach ((string name, Func<Route?> open) in setups)
+        {
+            Log.Info($"Trying {name}.");
+            Route? route;
+            try
+            {
+                route = open();
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"{name}: could not be set up", ex);
+                Fallback(name, ex.Message);
+                TryDelete(TemporaryPath);
+                continue;
+            }
+
+            if (route is null)
+            {
+                // TryOpenGpuRoute has already noted why.
+                TryDelete(TemporaryPath);
+                continue;
+            }
+
+            try
+            {
+                if (simulate)
+                {
+                    simulate = false;
+                    route.Writer.SimulateWriteFailure = true;
+                }
+
+                firstFrameWritten = Stopwatch.GetTimestamp();
+                if (!ProduceFrame(0, route))
+                {
+                    throw new InvalidOperationException("Frame 0 could not be written.");
+                }
+
+                FramePath = route.Describe();
+                UsesGpuPath = route.Gpu is not null;
+                Encoder = route.Writer.Encoder;
+                ConverterDescription = route.ConverterDescription;
+                EncoderInputType = route.Writer.InputType;
+                EncoderInputStream = route.Writer.EncoderInputStream;
+                Log.Info($"Frame 0 accepted. In use: {FramePath}");
+                return route;
+            }
+            catch (Exception ex)
+            {
+                RecordSetupFailure(name, route, ex);
+                route.Dispose();
+                TryDelete(TemporaryPath);
+                lock (_frameLock)
+                {
+                    // The next set-up starts again from the newest captured frame.
+                    _latestUnused = _latest is not null;
+                }
+            }
+        }
+
+        throw new InvalidOperationException($"No way to record could be set up. {string.Join(" | ", _fallbacks)}");
+    }
+
+    /// <summary>GPU frames into a hardware encoder, or null (with the reason in <see cref="Fallbacks"/>).</summary>
+    private Route? TryOpenGpuRoute(CaptureDevice device, ID3D11Device* d3dDevice)
+    {
+        IMFDXGIDeviceManager* manager = TryCreateDeviceManager(d3dDevice);
+        if (manager == null)
+        {
+            Fallback(GpuSetup, "Media Foundation could not share the GPU device with the encoder (see the log)");
+            return null;
+        }
+
+        GpuFrameConverter? gpu = null;
+        H264Mp4Writer? writer = null;
+        GpuSamplePool? samples = null;
+        try
+        {
+            gpu = GpuFrameConverter.TryCreate(d3dDevice, CaptureSize, OutputSize, Preset.FramesPerSecond);
+            if (gpu is null)
+            {
+                Fallback(GpuSetup, "the Direct3D 11 video processor cannot scale and convert these frames (see the log)");
+                return null;
+            }
+
+            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter);
+            if (!writer.Encoder.IsHardware)
+            {
+                Fallback(GpuSetup, "no hardware encoder accepted the settings (GPU frames are only used with a hardware encoder)");
+                return null;
+            }
+
+            samples = CreateSamplePool(manager, gpu, writer, out string? problem);
+            if (samples is null)
+            {
+                Fallback(GpuSetup, $"no GPU textures that both the video processor and the encoder can use: {problem}");
+                return null;
+            }
+
+            var route = new Route(GpuSetup, writer, gpu, samples, null, manager);
+            writer = null;
+            gpu = null;
+            samples = null;
+            manager = null;
+            return route;
+        }
+        finally
+        {
+            // The writer first: releasing it releases the encoder, which hands any GPU sample back to the pool.
+            writer?.Dispose();
+            samples?.Dispose();
+            gpu?.Dispose();
+            if (manager != null)
+            {
+                manager->Release();
+            }
+        }
+    }
+
+    /// <summary>CPU frames into the encoder; a hardware one when allowed and available, else the software one.</summary>
+    private Route OpenCpuRoute(CaptureDevice device, ID3D11Device* d3dDevice, bool hardware)
+    {
+        var cpu = new CpuFrameConverter(d3dDevice, OutputSize);
+        try
+        {
+            // No device manager: a hardware encoder then takes frames from memory and runs on its own GPU device.
+            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter);
+            var route = new Route(hardware ? CpuHardwareSetup : CpuSoftwareSetup, writer, null, null, cpu, null);
+            cpu = null;
+            return route;
+        }
+        finally
+        {
+            cpu?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The GPU textures the video processor draws into and the encoder reads. When the encoder names bind flags for
+    /// its input textures, those are tried first (on top of RENDER_TARGET, which the video processor needs), then
+    /// RENDER_TARGET alone. Each candidate is checked by drawing a view onto one of its textures.
+    /// </summary>
+    private GpuSamplePool? CreateSamplePool(IMFDXGIDeviceManager* manager, GpuFrameConverter gpu, H264Mp4Writer writer, out string? problem)
+    {
+        problem = null;
+        var candidates = new List<(uint BindFlags, bool Shared)>();
+        uint requested = writer.RequestedBindFlags ?? 0;
+        if ((requested & ~RenderTarget) != 0 || writer.RequestedSharedWithoutMutex)
+        {
+            candidates.Add((requested | RenderTarget, writer.RequestedSharedWithoutMutex));
+            Log.Decision($"The encoder asks for input textures with bind {MediaFoundationDiagnostics.BindFlagsText(requested)}{(writer.RequestedSharedWithoutMutex ? ", shared" : "")}; trying that first.");
+        }
+
+        candidates.Add((RenderTarget, false));
+        foreach ((uint bindFlags, bool shared) in candidates)
+        {
+            GpuSamplePool? samples = GpuSamplePool.TryCreate(manager, OutputSize, Preset.FramesPerSecond, bindFlags, shared);
+            if (samples is null)
+            {
+                problem = $"the GPU video samples (bind {MediaFoundationDiagnostics.BindFlagsText(bindFlags)}) could not be created (see the log)";
+                continue;
+            }
+
+            problem = CheckPool(gpu, samples);
+            if (problem is null)
+            {
+                return samples;
+            }
+
+            samples.Dispose();
+        }
+
+        return null;
+    }
+
+    private void RecordSetupFailure(string name, Route route, Exception ex)
+    {
+        Log.Error($"{name}: frame 0 was refused", ex);
+        Fallback(name, $"frame 0 was refused: {ex.Message}");
+        string details;
+        try
+        {
+            details = FailureDetails($"{name}: frame 0 was refused", route, ex);
+        }
+        catch (Exception describeError)
+        {
+            // Never let the description stop the fallback.
+            Log.Error("Describing the refused set-up failed", describeError);
+            details = $"--- {name}: frame 0 was refused{Environment.NewLine}Error: {ex.Message}{Environment.NewLine}(describing it failed: {describeError.Message}){Environment.NewLine}";
+        }
+
+        _setupFailures.Append(details);
+        Log.Info($"Details of the refused set-up:{Environment.NewLine}{details}");
+    }
+
+    private void RecordFailureDetails(Route route, string what, Exception ex)
+    {
+        try
+        {
+            string details = FailureDetails($"{route.Name}: {what}", route, ex);
+            RecordingFailure += details;
+            Log.Info($"Failure details:{Environment.NewLine}{details}");
+        }
+        catch (Exception describeError)
+        {
+            Log.Error("Describing the failure failed", describeError);
+        }
+    }
+
+    /// <summary>The error, the sample that was sent (when known), the GPU samples and everything about the encoder.</summary>
+    private static string FailureDetails(string title, Route route, Exception ex)
+    {
+        var text = new StringBuilder();
+        text.AppendLine($"--- {title}");
+        text.AppendLine($"Error: {ex.Message}");
+        if (ex is MediaFoundationException { Details: { } details })
+        {
+            text.AppendLine($"Sample sent: {details}");
+        }
+
+        text.AppendLine($"Frame conversion: {route.ConverterDescription}");
+        if (route.Samples is not null)
+        {
+            text.AppendLine($"GPU samples: {route.Samples.Summary}");
+        }
+
+        text.AppendLine(route.Writer.Diagnostics());
+        return text.ToString();
+    }
+
+    private void Fallback(string setup, string reason)
+    {
+        _fallbacks.Add($"{setup}: {reason}");
+        Log.Decision($"Not using {setup}: {reason}.");
+    }
+
+    /// <summary>Finishes the file (if any frame was written) and releases the set-up.</summary>
+    private void CloseRoute(Route route)
+    {
+        WriterStatistics = route.Writer.Statistics();
+        GpuSamples = route.Samples?.Summary ?? "";
+        if (Stats.FramesWritten > 0)
+        {
+            long finalizeStart = Stopwatch.GetTimestamp();
+            try
+            {
+                route.Writer.FinishFile();
+                FileFinalized = true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Finishing the MP4 file failed", ex);
+                Stats.AddError($"Finishing the MP4 file failed: {ex.Message}");
+                RecordFailureDetails(route, "finishing the MP4 file failed", ex);
+            }
+
+            Stats.FinalizeSeconds = Stopwatch.GetElapsedTime(finalizeStart).TotalSeconds;
+        }
+
+        try
+        {
+            route.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Releasing the encoder and converters failed", ex);
+        }
+    }
+
+    private void RunFrames(Route route, IDXGIAdapter3* adapter3, long start)
     {
         using var timer = new HighResolutionTimer();
         PacingTimer = timer.IsHighResolution ? "high-resolution waitable timer" : "standard waitable timer";
@@ -319,60 +596,66 @@ internal sealed unsafe class RecordingSession
         TimeSpan cpuAtStart = process.TotalProcessorTime;
         long frequency = Stopwatch.Frequency;
         int fps = Preset.FramesPerSecond;
-        long start = Stopwatch.GetTimestamp();
         Stats.StartTimestamp = start;
         Stats.StartedLocal = DateTime.Now;
         Log.Info($"Recording: pacing {fps} fps with a {PacingTimer}.");
 
-        long slot = 0;
+        // Frame 0 was written when the set-up was tested; the clock starts there.
+        long slot = 1;
+        Slots = 1;
         long nextResourceSample = 0;
         int lateWarnings = 0;
-        while (!_stopRequested && !_itemClosed)
+        try
         {
-            long due = start + (slot * frequency / fps);
-            timer.WaitUntil(due);
-            long now = Stopwatch.GetTimestamp();
-            double lateMs = (now - due) * 1000.0 / frequency;
-            Stats.Ticks++;
-            Stats.LatenessSumMs += lateMs;
-            Stats.LatenessMaxMs = Math.Max(Stats.LatenessMaxMs, lateMs);
-
-            long behind = (now - due) * fps / frequency;
-            if (behind > 0)
+            while (!_stopRequested && !_itemClosed)
             {
-                // Held up for more than a frame: the slots that already passed are dropped (the picture holds).
-                Stats.FramesDroppedLate += behind;
-                slot += behind;
-                if (lateWarnings++ < 10)
+                long due = start + (slot * frequency / fps);
+                timer.WaitUntil(due);
+                long now = Stopwatch.GetTimestamp();
+                double lateMs = (now - due) * 1000.0 / frequency;
+                Stats.Ticks++;
+                Stats.LatenessSumMs += lateMs;
+                Stats.LatenessMaxMs = Math.Max(Stats.LatenessMaxMs, lateMs);
+
+                long behind = (now - due) * fps / frequency;
+                if (behind > 0)
                 {
-                    Log.Warn($"Pacing fell {behind} frame(s) behind ({lateMs:0} ms late); those frames are dropped.");
+                    // Held up for more than a frame: the slots that already passed are dropped (the picture holds).
+                    Stats.FramesDroppedLate += behind;
+                    slot += behind;
+                    if (lateWarnings++ < 10)
+                    {
+                        Log.Warn($"Pacing fell {behind} frame(s) behind ({lateMs:0} ms late); those frames are dropped.");
+                    }
+                }
+
+                long workStart = Stopwatch.GetTimestamp();
+                ProduceFrame(slot, route);
+                double workMs = Stopwatch.GetElapsedTime(workStart).TotalMilliseconds;
+                Stats.WorkSumMs += workMs;
+                Stats.WorkMaxMs = Math.Max(Stats.WorkMaxMs, workMs);
+                slot++;
+                Slots = slot;
+
+                if (slot >= nextResourceSample)
+                {
+                    nextResourceSample = slot + (2 * fps);
+                    SampleResources(adapter3);
                 }
             }
-
-            long workStart = Stopwatch.GetTimestamp();
-            ProduceFrame(slot, gpu, samples, cpu, writer);
-            double workMs = Stopwatch.GetElapsedTime(workStart).TotalMilliseconds;
-            Stats.WorkSumMs += workMs;
-            Stats.WorkMaxMs = Math.Max(Stats.WorkMaxMs, workMs);
-            slot++;
-            Slots = slot;
-
-            if (slot >= nextResourceSample)
-            {
-                nextResourceSample = slot + (2 * fps);
-                SampleResources(adapter3);
-            }
         }
-
-        Stats.EndTimestamp = Stopwatch.GetTimestamp();
-        process.Refresh();
-        Stats.CpuTime = process.TotalProcessorTime - cpuAtStart;
-        Stats.PrivateBytesPeak = Math.Max(Stats.PrivateBytesPeak, process.PrivateMemorySize64);
-        SampleResources(adapter3);
+        finally
+        {
+            Stats.EndTimestamp = Stopwatch.GetTimestamp();
+            process.Refresh();
+            Stats.CpuTime = process.TotalProcessorTime - cpuAtStart;
+            Stats.PrivateBytesPeak = Math.Max(Stats.PrivateBytesPeak, process.PrivateMemorySize64);
+            SampleResources(adapter3);
+        }
     }
 
-    /// <summary>Encodes output frame <paramref name="slot"/> from the newest captured frame.</summary>
-    private void ProduceFrame(long slot, GpuFrameConverter? gpu, GpuSamplePool? samples, CpuFrameConverter? cpu, H264Mp4Writer writer)
+    /// <summary>Encodes output frame <paramref name="slot"/> from the newest captured frame. False if it was dropped.</summary>
+    private bool ProduceFrame(long slot, Route route)
     {
         long time = Preset.FrameTime(slot);
         long duration = Preset.FrameTime(slot + 1) - time;
@@ -385,22 +668,22 @@ internal sealed unsafe class RecordingSession
             if (frame is null)
             {
                 Stats.FramesDroppedLate++;
-                return;
+                return false;
             }
 
             fresh = _latestUnused;
-            if (gpu is not null)
+            if (route.Gpu is not null)
             {
-                if (!samples!.TryTake(out sample, out ID3D11Texture2D* target, out uint subresource))
+                if (!route.Samples!.TryTake(out sample, out ID3D11Texture2D* target, out uint subresource))
                 {
                     // Every GPU sample is still with the encoder: it has fallen behind. Drop this slot.
                     Stats.FramesDroppedEncoderBusy++;
-                    return;
+                    return false;
                 }
 
                 try
                 {
-                    gpu.Convert(frame.Texture, frame.ContentSize, target, subresource);
+                    route.Gpu.Convert(frame.Texture, frame.ContentSize, target, subresource);
                 }
                 catch
                 {
@@ -412,9 +695,9 @@ internal sealed unsafe class RecordingSession
                     target->Release();
                 }
             }
-            else if (fresh || !_cpuHasFrame)
+            else if (fresh || !route.CpuHasFrame)
             {
-                cpu!.CopyFrom(frame.Texture, frame.ContentSize);
+                route.Cpu!.CopyFrom(frame.Texture, frame.ContentSize);
                 convertOnCpu = true;
             }
 
@@ -423,11 +706,11 @@ internal sealed unsafe class RecordingSession
 
         // Outside the lock: the GPU work is already queued; the CPU path waits for its copy here.
         long writeStart = Stopwatch.GetTimestamp();
-        if (gpu is not null)
+        if (route.Gpu is not null)
         {
             try
             {
-                writer.WriteSample(sample, time, duration);
+                route.Writer.WriteSample(sample, time, duration);
             }
             finally
             {
@@ -438,11 +721,11 @@ internal sealed unsafe class RecordingSession
         {
             if (convertOnCpu)
             {
-                cpu!.Convert();
-                _cpuHasFrame = true;
+                route.Cpu!.Convert();
+                route.CpuHasFrame = true;
             }
 
-            writer.WriteNv12(cpu!.LastFrame, time, duration);
+            route.Writer.WriteNv12(route.Cpu!.LastFrame, time, duration);
         }
 
         Stats.WriteMaxMs = Math.Max(Stats.WriteMaxMs, Stopwatch.GetElapsedTime(writeStart).TotalMilliseconds);
@@ -451,25 +734,41 @@ internal sealed unsafe class RecordingSession
         {
             Stats.FramesDuplicated++;
         }
+
+        return true;
     }
 
-    /// <summary>Checks that the video processor can write into the pool's textures before the recording relies on it.</summary>
-    private static bool CanConvertInto(GpuFrameConverter gpu, GpuSamplePool samples)
+    /// <summary>
+    /// Takes one sample from a new pool (which also sets its buffer length) and checks that the video processor can
+    /// draw into its texture. Null when it can; otherwise why not.
+    /// </summary>
+    private static string? CheckPool(GpuFrameConverter gpu, GpuSamplePool samples)
     {
-        if (!samples.TryTake(out IMFSample* sample, out ID3D11Texture2D* target, out uint subresource))
+        IMFSample* sample;
+        ID3D11Texture2D* target;
+        uint subresource;
+        try
         {
-            return false;
+            if (!samples.TryTake(out sample, out target, out subresource))
+            {
+                return "the new sample pool had no free sample";
+            }
+        }
+        catch (MediaFoundationException ex)
+        {
+            Log.Error("Preparing a GPU sample failed", ex);
+            return ex.Message;
         }
 
         try
         {
             gpu.CheckTarget(target, subresource);
-            return true;
+            return null;
         }
         catch (MediaFoundationException ex)
         {
-            Log.Error("The video processor cannot write into the encoder's GPU textures", ex);
-            return false;
+            Log.Error("The video processor cannot draw into the encoder's GPU textures", ex);
+            return ex.Message;
         }
         finally
         {
@@ -666,6 +965,55 @@ internal sealed unsafe class RecordingSession
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Log.Warn($"Could not delete {path}: {ex.Message}");
+        }
+    }
+
+    /// <summary>One way from captured frame to file: the converter, the GPU samples (GPU path only) and the writer.</summary>
+    private sealed class Route : IDisposable
+    {
+        private IMFDXGIDeviceManager* _manager;
+
+        public Route(string name, H264Mp4Writer writer, GpuFrameConverter? gpu, GpuSamplePool? samples, CpuFrameConverter? cpu, IMFDXGIDeviceManager* manager)
+        {
+            Name = name;
+            Writer = writer;
+            Gpu = gpu;
+            Samples = samples;
+            Cpu = cpu;
+            _manager = manager;
+        }
+
+        public string Name { get; }
+
+        public H264Mp4Writer Writer { get; }
+
+        public GpuFrameConverter? Gpu { get; }
+
+        public GpuSamplePool? Samples { get; }
+
+        public CpuFrameConverter? Cpu { get; }
+
+        /// <summary>CPU path: the converter holds a converted frame, which an unchanged screen reuses.</summary>
+        public bool CpuHasFrame { get; set; }
+
+        public string ConverterDescription => Gpu?.Description ?? Cpu?.Description ?? "";
+
+        public string Describe() => (Gpu is not null
+            ? "GPU frames (Direct3D 11 video processor; frames stay on the GPU)"
+            : "CPU frames (copied to memory, scaled on the CPU)") + $" -> {Writer.Encoder.Summary}";
+
+        public void Dispose()
+        {
+            // The writer first: releasing it releases the encoder, which hands every GPU sample back to the pool.
+            Writer.Dispose();
+            Samples?.Dispose();
+            Gpu?.Dispose();
+            Cpu?.Dispose();
+            if (_manager != null)
+            {
+                _manager->Release();
+                _manager = null;
+            }
         }
     }
 

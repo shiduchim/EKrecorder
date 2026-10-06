@@ -12,8 +12,8 @@ namespace EKrecorder;
 
 /// <summary>
 /// The small test window: pick a monitor, Identify, Start/Stop recording, open the recordings and the last report,
-/// and the Step 1 capture test. In self-test mode (the build machine) it runs the capture test and a 6-second
-/// recording on Monitor 1, asks nothing, and closes.
+/// and the Step 1 capture test. In self-test mode (the build machine) it runs the capture test, a 6-second recording
+/// and a 3-second recording whose first set-up is made to fail (to prove the fallback), asks nothing, and closes.
 /// </summary>
 internal sealed class SpikeForm : Form
 {
@@ -90,7 +90,7 @@ internal sealed class SpikeForm : Form
         Controls.Add(layout);
 
         _identifyButton.Click += (_, _) => ShowIdentify();
-        _startButton.Click += async (_, _) => await StartRecordingAsync();
+        _startButton.Click += async (_, _) => await StartRecordingAsync(simulateFirstSetupFailure: false);
         _stopButton.Click += async (_, _) => await StopRecordingAsync("Stop button");
         _recordingsButton.Click += (_, _) => OpenRecordingsFolder();
         _reportButton.Click += (_, _) => OpenFile(_lastReportPath);
@@ -234,7 +234,7 @@ internal sealed class SpikeForm : Form
         _identify = null;
     }
 
-    private async Task StartRecordingAsync()
+    private async Task StartRecordingAsync(bool simulateFirstSetupFailure)
     {
         if (_busy || _recording is not null)
         {
@@ -259,7 +259,7 @@ internal sealed class SpikeForm : Form
             CaptureAccessResult borderless = await CaptureSessionSetup.RequestAccessAsync(GraphicsCaptureAccessKind.Borderless);
             Directory.CreateDirectory(_folders.InProgress);
             string temporaryPath = Path.Combine(_folders.InProgress, $"EKrecording {DateTime.Now:yyyy-MM-dd HH-mm-ss}.mp4");
-            RecordingSession session = await RecordingSession.StartAsync(monitor, RecordingPreset.Default, temporaryPath, borderless.Text);
+            RecordingSession session = await RecordingSession.StartAsync(monitor, RecordingPreset.Default, temporaryPath, borderless.Text, simulateFirstSetupFailure);
             _recording = session;
 
             _indicator = new RecordingIndicator();
@@ -355,25 +355,40 @@ internal sealed class SpikeForm : Form
         RecordingStats stats = session.Stats;
         TimeSpan length = TimeSpan.FromTicks(session.Preset.FrameTime(session.Slots));
         string dropped = stats.FramesDropped > 0 ? $", {stats.FramesDropped} dropped" : "";
+        string frames = session.UsesGpuPath ? "GPU frames" : "CPU frames";
         SetStatus(string.Create(CultureInfo.InvariantCulture,
-            $"Recording {session.Monitor.Name}: {length:hh\\:mm\\:ss}, {session.OutputSize.Width}x{session.OutputSize.Height} at {session.Preset.FramesPerSecond} fps, {session.Encoder?.Summary ?? "encoder"}{dropped}."));
+            $"Recording {session.Monitor.Name}: {length:hh\\:mm\\:ss}, {session.OutputSize.Width}x{session.OutputSize.Height} at {session.Preset.FramesPerSecond} fps, {frames} -> {session.Encoder?.Summary ?? "encoder"}{dropped}."));
     }
 
     private async Task RunRecordingSelfTestAsync()
     {
-        await StartRecordingAsync();
-        if (_recording is null)
+        // A normal recording, then one whose first set-up is made to refuse frame 0: the next set-up must take over,
+        // the file must be saved, and the report must show the failure.
+        bool normal = await RecordForSelfTestAsync(TimeSpan.FromSeconds(6), simulateFirstSetupFailure: false);
+        bool fallback = await RecordForSelfTestAsync(TimeSpan.FromSeconds(3), simulateFirstSetupFailure: true);
+        if (!normal || !fallback)
         {
             ExitCode = Math.Max(ExitCode, 1);
-            return;
+        }
+    }
+
+    private async Task<bool> RecordForSelfTestAsync(TimeSpan length, bool simulateFirstSetupFailure)
+    {
+        string name = simulateFirstSetupFailure ? "Self-test recording with a simulated set-up failure" : "Self-test recording";
+        await StartRecordingAsync(simulateFirstSetupFailure);
+        RecordingSession? session = _recording;
+        if (session is null)
+        {
+            Log.Error($"{name}: FAIL (it did not start)");
+            return false;
         }
 
-        await Task.Delay(TimeSpan.FromSeconds(6));
+        await Task.Delay(length);
         FinishedRecording? finished = await StopRecordingAsync("self-test finished");
-        if (finished is null || !finished.Saved)
-        {
-            ExitCode = Math.Max(ExitCode, 1);
-        }
+        bool fallbackShown = !simulateFirstSetupFailure || session.SetupFailures.Contains("simulated by the self-test", StringComparison.Ordinal);
+        bool passed = finished is { Saved: true } && fallbackShown;
+        Log.Info($"{name}: {(passed ? "PASS" : "FAIL")} (saved: {finished?.Saved == true}; set-up failure reported: {fallbackShown}; {session.FramePath})");
+        return passed;
     }
 
     private async Task RunTestAsync()

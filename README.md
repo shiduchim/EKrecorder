@@ -15,8 +15,10 @@ This repository holds the test build. **Step 1** (done) proved the monitor, capt
 - Paces the output at 15 fps on the QueryPerformanceCounter clock. When the screen has not changed, the previous
   picture is repeated ("duplicated frame"), so the file has a constant frame rate.
 - Keeps frames on the GPU: the Direct3D 11 video processor scales and converts BGRA to NV12, and the frames go
-  straight into Media Foundation's hardware H.264 encoder (NVIDIA, Intel or AMD). The software encoder is used only
-  when no hardware encoder is available; a CPU path is used only when the GPU cannot scale.
+  straight into Media Foundation's hardware H.264 encoder (NVIDIA, Intel or AMD).
+- Checks that set-up with the first frame. If the encoder refuses it, EKrecorder tries the next set-up: CPU frames
+  into the hardware encoder, then CPU frames into the software encoder. The report names the set-up in use, every
+  fallback and why, and, for a refused frame, the sample, its GPU texture and the encoder's media types in full.
 - Shows the blue corner triangle while recording. It is excluded from capture, so it is not in the video.
 - Writes the file to `%LocalAppData%\EKrecorder\InProgress` while recording, then moves it to
   `Desktop\EKrecordings` with a timestamped name, for example `EKrecording 2026-10-06 14-03-22.mp4`.
@@ -36,6 +38,7 @@ installer.
    **Run anyway** (the test build is not signed).
 6. Pick a monitor, click **Start recording**, use the PC for 1–2 minutes, then click **Stop recording**.
 7. The video is in Desktop > EKrecordings. The report opens in Notepad: paste its **SUMMARY** part into our chat.
+   If the report has a **FAILURE DETAILS** part, paste the whole report.
 
 ## Build it yourself
 
@@ -61,5 +64,7 @@ The workflow in `.github/workflows/build.yml` builds on Windows, publishes one s
 | `src/EKrecorder/Recording/RecordingSession.cs` | One recording: capture, 15 fps pacing, conversion, encoding |
 | `src/EKrecorder/Recording/GpuFrameConverter.cs` | GPU scaling and BGRA→NV12 with the Direct3D 11 video processor |
 | `src/EKrecorder/Recording/CpuFrameConverter.cs` | CPU fallback for the same |
+| `src/EKrecorder/Recording/GpuSamplePool.cs` | The encoder's GPU input textures (Media Foundation sample allocator) |
 | `src/EKrecorder/Recording/H264Mp4Writer.cs` | Media Foundation H.264 → MP4, encoder choice and settings |
+| `src/EKrecorder/Recording/MediaFoundationDiagnostics.cs` | Samples, textures and media types as text, for the report |
 | `src/EKrecorder/Recording/RecordingReport.cs` | Moves the finished file, reads it back, writes the report |

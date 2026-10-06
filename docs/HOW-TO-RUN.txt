@@ -18,6 +18,7 @@ Default: at most 1920x1080, 15 frames per second, H.264, about 2 Mbps.
 
 5. The finished video is saved in Desktop > EKrecordings.
    A report opens in Notepad. Copy its SUMMARY part and paste it into our chat.
+   If the report has a FAILURE DETAILS part, paste the whole report instead.
    "Open last report" opens it again later. "Open recordings" opens the video folder.
 
 While recording, the file is kept in %LocalAppData%\EKrecorder\InProgress and moved to

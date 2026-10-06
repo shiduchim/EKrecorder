@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using EKrecorder.Capture;
 using EKrecorder.Diagnostics;
 using TerraFX.Interop.Windows;
@@ -24,25 +25,43 @@ internal sealed record EncoderInfo(
 }
 
 /// <summary>
-/// H.264 in MP4 through the Media Foundation sink writer. It prefers a hardware encoder; the software encoder is used
-/// only when no hardware encoder accepts the settings. Rate control is tried in order: peak-constrained VBR
-/// (2 Mbps average, 6 Mbps peak), unconstrained VBR, CBR, then the same on Main profile, then encoder defaults.
+/// H.264 in MP4 through the Media Foundation sink writer. <see cref="Create"/> either allows hardware encoders (the sink
+/// writer then loads one if the PC has one) or uses the software encoder only. Rate control is tried in order:
+/// peak-constrained VBR (2 Mbps average, 6 Mbps peak), unconstrained VBR, CBR, then the same on Main profile, then
+/// encoder defaults.
 /// </summary>
 internal sealed unsafe class H264Mp4Writer : IDisposable
 {
     private const uint MFT_ENUM_FLAG_HARDWARE = 0x4;
     private const uint MFT_ENUM_FLAG_SORTANDFILTER = 0x40;
+    private const int E_INVALIDARG = unchecked((int)0x80070057);
 
     private readonly uint _stream;
     private IMFSinkWriter* _writer;
 
-    private H264Mp4Writer(IMFSinkWriter* writer, uint stream)
+    private H264Mp4Writer(IMFSinkWriter* writer, uint stream, string inputType)
     {
         _writer = writer;
         _stream = stream;
+        InputType = inputType;
     }
 
     public EncoderInfo Encoder { get; private set; } = new(false, "unknown", "unknown", "", "", "", "", "", "", "");
+
+    /// <summary>The input media type given to the sink writer, every attribute.</summary>
+    public string InputType { get; }
+
+    /// <summary>What the encoder's input stream asks of the samples it gets (IMFTransform::GetInputStreamAttributes).</summary>
+    public string EncoderInputStream { get; private set; } = "not read";
+
+    /// <summary>The D3D11 bind flags the encoder asks for on its input textures (MF_SA_D3D11_BINDFLAGS), if it says.</summary>
+    public uint? RequestedBindFlags { get; private set; }
+
+    /// <summary>True when the encoder asks for shareable input textures (MF_SA_D3D11_SHARED_WITHOUT_MUTEX).</summary>
+    public bool RequestedSharedWithoutMutex { get; private set; }
+
+    /// <summary>Self-test only: the next <see cref="WriteSample"/> fails as if the encoder had rejected the sample.</summary>
+    public bool SimulateWriteFailure { get; set; }
 
     /// <summary>Hardware H.264 encoders Windows lists on this PC (for the report).</summary>
     public static IReadOnlyList<string> ListHardwareEncoders()
@@ -74,41 +93,56 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     }
 
     /// <summary>
-    /// Opens <paramref name="path"/> for writing. <paramref name="manager"/> may be null (CPU frames).
-    /// <paramref name="gpuInput"/>: frames will arrive as GPU textures rather than memory buffers.
+    /// Opens <paramref name="path"/> for writing. <paramref name="manager"/> may be null (memory frames; a hardware
+    /// encoder then uses its own GPU device). <paramref name="gpuInput"/>: frames will arrive as GPU textures.
+    /// <paramref name="hardwareAllowed"/>: false uses the Microsoft software encoder only.
     /// </summary>
-    public static H264Mp4Writer Create(string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, AdapterInfo adapter)
+    public static H264Mp4Writer Create(
+        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter)
     {
         var failures = new List<string>();
-        foreach (bool hardware in new[] { true, false })
+        foreach (Plan plan in Plans(preset))
         {
-            if (!hardware)
+            H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, out string failure);
+            if (writer is not null)
             {
-                Log.Decision("No encoder accepted the settings with hardware encoding allowed; trying software encoding only.");
+                writer.Identify(plan, preset, adapter);
+                writer.ReadEncoderInput();
+                return writer;
             }
 
-            foreach (Plan plan in Plans(preset))
-            {
-                H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardware, plan, out string failure);
-                if (writer is not null)
-                {
-                    writer.Identify(plan, preset, adapter);
-                    return writer;
-                }
-
-                failures.Add($"{(hardware ? "hardware allowed" : "software only")}, {plan.Name}: {failure}");
-            }
+            failures.Add($"{plan.Name}: {failure}");
         }
 
-        throw new InvalidOperationException("No H.264 encoder could be set up: " + string.Join(" | ", failures));
+        throw new InvalidOperationException(
+            $"No H.264 encoder could be set up ({(hardwareAllowed ? "hardware allowed" : "software only")}): {string.Join(" | ", failures)}");
     }
 
-    /// <summary>Writes one frame. The sample's texture or buffer must not change until the encoder releases it.</summary>
+    /// <summary>
+    /// Writes one frame. The sample's texture or buffer must not change until the encoder releases it. On failure the
+    /// exception's <see cref="MediaFoundationException.Details"/> describes the sample that was refused.
+    /// </summary>
     public void WriteSample(IMFSample* sample, long time, long duration)
     {
         Check(sample->SetSampleTime(time), "IMFSample::SetSampleTime");
         Check(sample->SetSampleDuration(duration), "IMFSample::SetSampleDuration");
-        Check(_writer->WriteSample(_stream, sample), "IMFSinkWriter::WriteSample");
+        string operation = "IMFSinkWriter::WriteSample";
+        HRESULT hr;
+        if (SimulateWriteFailure)
+        {
+            SimulateWriteFailure = false;
+            operation += " (simulated by the self-test)";
+            hr = E_INVALIDARG;
+        }
+        else
+        {
+            hr = _writer->WriteSample(_stream, sample);
+        }
+
+        if (hr.FAILED)
+        {
+            throw new MediaFoundationException(operation, hr) { Details = MediaFoundationDiagnostics.DescribeSample(sample) };
+        }
     }
 
     /// <summary>Writes one NV12 frame from memory (CPU path).</summary>
@@ -149,6 +183,42 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         return hr.FAILED
             ? $"not available ({Describe(hr)})"
             : $"{statistics.qwNumSamplesReceived} frames received, {statistics.qwNumSamplesEncoded} encoded, {statistics.qwNumSamplesProcessed} written to the file";
+    }
+
+    /// <summary>Everything about the encoder and the media types on both sides of it, for a failure report.</summary>
+    public string Diagnostics()
+    {
+        var text = new StringBuilder();
+        text.AppendLine($"Encoder: {Encoder.Summary} - \"{Encoder.Name}\" (identified by {Encoder.IdentifiedBy}); settings requested: {Encoder.Plan}");
+        text.AppendLine($"Input media type given to the sink writer: {InputType}");
+        IMFTransform* transform = GetEncoder();
+        if (transform != null)
+        {
+            try
+            {
+                text.AppendLine($"Encoder input type now: {DescribeCurrentType(transform, input: true)}");
+                text.AppendLine($"Encoder output type now: {DescribeCurrentType(transform, input: false)}");
+                IMFAttributes* attributes = null;
+                HRESULT hr = transform->GetAttributes(&attributes);
+                text.AppendLine($"Encoder attributes: {(hr.SUCCEEDED && attributes != null ? MediaFoundationDiagnostics.DescribeAttributes(attributes) : $"not available ({Describe(hr)})")}");
+                if (attributes != null)
+                {
+                    attributes->Release();
+                }
+            }
+            finally
+            {
+                transform->Release();
+            }
+        }
+        else
+        {
+            text.AppendLine("Encoder: its IMFTransform is not available from the sink writer");
+        }
+
+        text.AppendLine($"Encoder input stream attributes: {EncoderInputStream}");
+        text.Append($"Sink writer: {Statistics()}");
+        return text.ToString();
     }
 
     /// <summary>Drains the encoder and writes the MP4 index. Without this the file cannot be played.</summary>
@@ -208,15 +278,14 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             uint stream;
             Check(writer->AddStream(outputType, &stream), "IMFSinkWriter::AddStream");
 
+            // Uncompressed NV12 with tightly packed rows, stated in full for GPU frames as well as memory frames:
+            // the frame size in bytes is then the same everywhere (media type, sample buffers, encoder).
             inputType = CreateVideoType(in MFVideoFormat.MFVideoFormat_NV12, size.Width, size.Height, preset.FramesPerSecond);
-            if (!gpuInput)
-            {
-                // Memory frames: tightly packed NV12 rows.
-                Check(inputType->SetUINT32(Ptr(in MF.MF_MT_DEFAULT_STRIDE), (uint)size.Width), "set MF_MT_DEFAULT_STRIDE");
-                Check(inputType->SetUINT32(Ptr(in MF.MF_MT_SAMPLE_SIZE), (uint)(size.Width * size.Height * 3 / 2)), "set MF_MT_SAMPLE_SIZE");
-                Check(inputType->SetUINT32(Ptr(in MF.MF_MT_FIXED_SIZE_SAMPLES), 1), "set MF_MT_FIXED_SIZE_SAMPLES");
-                Check(inputType->SetUINT32(Ptr(in MF.MF_MT_ALL_SAMPLES_INDEPENDENT), 1), "set MF_MT_ALL_SAMPLES_INDEPENDENT");
-            }
+            Check(inputType->SetUINT32(Ptr(in MF.MF_MT_DEFAULT_STRIDE), (uint)size.Width), "set MF_MT_DEFAULT_STRIDE");
+            Check(inputType->SetUINT32(Ptr(in MF.MF_MT_SAMPLE_SIZE), (uint)(size.Width * size.Height * 3 / 2)), "set MF_MT_SAMPLE_SIZE");
+            Check(inputType->SetUINT32(Ptr(in MF.MF_MT_FIXED_SIZE_SAMPLES), 1), "set MF_MT_FIXED_SIZE_SAMPLES");
+            Check(inputType->SetUINT32(Ptr(in MF.MF_MT_ALL_SAMPLES_INDEPENDENT), 1), "set MF_MT_ALL_SAMPLES_INDEPENDENT");
+            string inputDescription = MediaFoundationDiagnostics.DescribeAttributes((IMFAttributes*)inputType);
 
             if (plan.UseEncoderSettings)
             {
@@ -227,7 +296,8 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             Check(writer->SetInputMediaType(stream, inputType, encoderSettings), "IMFSinkWriter::SetInputMediaType");
             Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
             Log.Info($"Sink writer ready: {plan.Name}, {(hardware ? "hardware encoders allowed" : "software only")}, {(gpuInput ? "GPU textures in" : "memory frames in")}");
-            var result = new H264Mp4Writer(writer, stream);
+            Log.Info($"Input media type: {inputDescription}");
+            var result = new H264Mp4Writer(writer, stream, inputDescription);
             writer = null;
             return result;
         }
@@ -294,17 +364,85 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
     }
 
+    /// <summary>The encoder the sink writer loaded (AddRef'ed), or null.</summary>
+    private IMFTransform* GetEncoder()
+    {
+        Guid noService = Guid.Empty;
+        IMFTransform* transform = null;
+        HRESULT hr = _writer->GetServiceForStream(_stream, &noService, __uuidof<IMFTransform>(), (void**)&transform);
+        return hr.SUCCEEDED ? transform : null;
+    }
+
+    private static string DescribeCurrentType(IMFTransform* transform, bool input)
+    {
+        IMFMediaType* type = null;
+        HRESULT hr = input ? transform->GetInputCurrentType(0, &type) : transform->GetOutputCurrentType(0, &type);
+        if (hr.FAILED || type == null)
+        {
+            return $"not available ({Describe(hr)})";
+        }
+
+        try
+        {
+            return MediaFoundationDiagnostics.DescribeAttributes((IMFAttributes*)type);
+        }
+        finally
+        {
+            type->Release();
+        }
+    }
+
+    /// <summary>
+    /// Reads what the encoder's input stream asks for. A hardware encoder can name the bind flags it wants on its
+    /// input textures (MF_SA_D3D11_BINDFLAGS); the GPU sample pool then creates its textures with them.
+    /// </summary>
+    private void ReadEncoderInput()
+    {
+        IMFTransform* transform = GetEncoder();
+        if (transform == null)
+        {
+            EncoderInputStream = "not available (the sink writer gives no IMFTransform)";
+            Log.Info($"Encoder input stream attributes: {EncoderInputStream}");
+            return;
+        }
+
+        IMFAttributes* attributes = null;
+        try
+        {
+            HRESULT hr = transform->GetInputStreamAttributes(0, &attributes);
+            if (hr.FAILED || attributes == null)
+            {
+                EncoderInputStream = $"not available ({Describe(hr)})";
+            }
+            else
+            {
+                EncoderInputStream = MediaFoundationDiagnostics.DescribeAttributes(attributes);
+                RequestedBindFlags = GetUInt32(attributes, in MF.MF_SA_D3D11_BINDFLAGS);
+                RequestedSharedWithoutMutex = GetUInt32(attributes, in MF.MF_SA_D3D11_SHARED_WITHOUT_MUTEX) is > 0;
+            }
+        }
+        finally
+        {
+            if (attributes != null)
+            {
+                attributes->Release();
+            }
+
+            transform->Release();
+        }
+
+        Log.Info($"Encoder input stream attributes: {EncoderInputStream}");
+    }
+
     /// <summary>Finds out which encoder the sink writer loaded, and reads its settings back.</summary>
     private void Identify(Plan plan, RecordingPreset preset, AdapterInfo adapter)
     {
-        Guid noService = Guid.Empty;
         bool isAsync = false;
         string? hardwareUrl = null;
         string? vendorId = null;
         string? friendlyName = null;
-        IMFTransform* transform = null;
-        HRESULT hr = _writer->GetServiceForStream(_stream, &noService, __uuidof<IMFTransform>(), (void**)&transform);
-        if (hr.SUCCEEDED && transform != null)
+        IMFTransform* transform = GetEncoder();
+        if (transform != null)
         {
             IMFAttributes* attributes = null;
             if (transform->GetAttributes(&attributes).SUCCEEDED && attributes != null)
@@ -313,6 +451,7 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
                 hardwareUrl = GetString(attributes, in MFT.MFT_ENUM_HARDWARE_URL_Attribute);
                 vendorId = GetString(attributes, in MFT.MFT_ENUM_HARDWARE_VENDOR_ID_Attribute);
                 friendlyName = GetString(attributes, in MFT.MFT_FRIENDLY_NAME_Attribute);
+                Log.Info($"Encoder attributes: {MediaFoundationDiagnostics.DescribeAttributes(attributes)}");
                 attributes->Release();
             }
 
@@ -320,7 +459,7 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
         else
         {
-            Log.Api("IMFSinkWriter::GetServiceForStream(IMFTransform)", false, Describe(hr));
+            Log.Api("IMFSinkWriter::GetServiceForStream(IMFTransform)", false, "the sink writer gives no IMFTransform");
         }
 
         // Hardware encoders are asynchronous MFTs that publish a hardware URL; the Microsoft software encoder is neither.
@@ -339,8 +478,9 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         string peak = "not reported";
         string gop = "not reported";
         string bFrames = "not reported";
+        Guid noService = Guid.Empty;
         ICodecAPI* codec = null;
-        hr = _writer->GetServiceForStream(_stream, &noService, __uuidof<ICodecAPI>(), (void**)&codec);
+        HRESULT hr = _writer->GetServiceForStream(_stream, &noService, __uuidof<ICodecAPI>(), (void**)&codec);
         if (hr.SUCCEEDED && codec != null)
         {
             if (ReadValue(codec, __uuidof<CODECAPI_AVEncCommonRateControlMode>()) is ulong mode)
@@ -380,7 +520,7 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         Log.Info($"ENCODER settings read back: rate control {rateControl}; average {average}; peak {peak}; keyframe interval {gop}; B-frames {bFrames}; requested {plan.Name}");
         if (!isHardware)
         {
-            Log.Decision("Software H.264 encoding is in use, because no hardware encoder was available for these settings.");
+            Log.Decision("Software H.264 encoding is in use for this set-up.");
         }
     }
 

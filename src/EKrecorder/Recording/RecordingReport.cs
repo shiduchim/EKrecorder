@@ -49,21 +49,37 @@ internal static class RecordingReport
         double recordedSeconds = preset.FrameTime(session.Slots) / 1e7;
         bool ok = session.FileFinalized && check?.Readable == true && stats.Errors.Count == 0;
         IReadOnlyList<string> errors = stats.Errors;
+        IReadOnlyList<string> fallbacks = session.Fallbacks;
+        string setupFailures = session.SetupFailures;
         string fileSize = check is not null ? Megabytes(check.FileBytes) : "no file";
-        string summaryLine = ok
-            ? $"Saved {Path.GetFileName(videoPath)} ({fileSize}, {Clock(TimeSpan.FromSeconds(recordedSeconds))})"
-            : session.FileFinalized ? $"Saved with problems: {Path.GetFileName(videoPath)}" : "The recording was NOT saved";
+        string saved = $"Saved {Path.GetFileName(videoPath)} ({fileSize}, {Clock(TimeSpan.FromSeconds(recordedSeconds))})";
+        string summaryLine = !session.FileFinalized ? "The recording was NOT saved"
+            : !ok ? $"Saved with problems: {Path.GetFileName(videoPath)}"
+            : session.UsesGpuPath ? saved
+            : $"{saved}, but not on the GPU path";
+        string result = !session.FileFinalized ? "RESULT: FAILED - the recording was not saved. See Errors."
+            : !ok ? "RESULT: SAVED WITH PROBLEMS - see Errors."
+            : session.UsesGpuPath ? "RESULT: OK - the recording was saved. Frames stayed on the GPU, from capture to encoder."
+            : setupFailures.Length > 0 ? "RESULT: SAVED, BUT NOT ON THE GPU PATH - a set-up was refused (see FAILURE DETAILS). Please send the whole report."
+            : "RESULT: OK - the recording was saved, but not on the GPU path (see Fallbacks).";
 
         var text = new StringBuilder();
         text.AppendLine("EKrecorder recording report");
         text.AppendLine(Invariant($"Created {DateTime.Now:yyyy-MM-dd HH:mm:ss} by EKrecorder {EnvironmentInfo.AppVersion}"));
         text.AppendLine();
-        text.AppendLine(ok ? "RESULT: OK - the recording was saved." : session.FileFinalized ? "RESULT: SAVED WITH PROBLEMS - see Errors." : "RESULT: FAILED - the recording was not saved. See Errors.");
+        text.AppendLine(result);
         text.AppendLine($"Video file: {videoPath ?? "none"}{(moveProblem is null ? "" : $" ({moveProblem})")}");
         text.AppendLine();
 
         text.AppendLine("SUMMARY (please send this part)");
         Line(text, "Encoder used", encoder is null ? "none" : $"{encoder.Summary} - \"{encoder.Name}\"");
+        Line(text, "Frame path", session.FramePath.Length > 0 ? session.FramePath : "none");
+        Line(text, "Fallbacks", fallbacks.Count == 0 ? "none" : $"{fallbacks.Count}, listed below");
+        if (session.UsesGpuPath)
+        {
+            Line(text, "GPU samples", session.GpuSamples);
+        }
+
         Line(text, "Output resolution", check is { Readable: true }
             ? $"{check.Width}x{check.Height} (monitor {session.CaptureSize.Width}x{session.CaptureSize.Height})"
             : $"{session.OutputSize.Width}x{session.OutputSize.Height} planned (monitor {session.CaptureSize.Width}x{session.CaptureSize.Height})");
@@ -91,6 +107,11 @@ internal static class RecordingReport
             text.AppendLine($"  ! {error}");
         }
 
+        foreach (string fallback in fallbacks)
+        {
+            text.AppendLine($"  > {fallback}");
+        }
+
         text.AppendLine();
         text.AppendLine("DETAILS");
         Line(text, "Monitor", session.Monitor.Summary);
@@ -107,6 +128,8 @@ internal static class RecordingReport
             Line(text, "B-frames", encoder.BFrames);
         }
 
+        Line(text, "Input media type", session.EncoderInputType.Length > 0 ? session.EncoderInputType : "-");
+        Line(text, "Encoder input stream", session.EncoderInputStream.Length > 0 ? session.EncoderInputStream : "-");
         Line(text, "Sink writer", session.WriterStatistics);
         Line(text, "Pacing", stats.Ticks > 0
             ? Invariant($"{session.PacingTimer}; wake-up lateness {stats.LatenessSumMs / stats.Ticks:0.0} ms average, {stats.LatenessMaxMs:0.0} ms max; work per frame {stats.WorkSumMs / stats.Ticks:0.0} ms average, {stats.WorkMaxMs:0.0} ms max; slowest WriteSample {stats.WriteMaxMs:0.0} ms")
@@ -122,6 +145,14 @@ internal static class RecordingReport
         }
 
         Line(text, "Log", Log.FilePath ?? "-");
+        if (setupFailures.Length > 0 || session.RecordingFailure.Length > 0)
+        {
+            text.AppendLine();
+            text.AppendLine("FAILURE DETAILS (please send this part too)");
+            text.Append(setupFailures);
+            text.Append(session.RecordingFailure);
+        }
+
         File.WriteAllText(reportPath, text.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
         Log.Info($"Recording report written: {reportPath}");
         return summaryLine;

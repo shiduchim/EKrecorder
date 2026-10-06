@@ -160,4 +160,7 @@ internal sealed class MediaFoundationException : Exception
     }
 
     public string Operation { get; }
+
+    /// <summary>What was passed to the failed call (for example the sample), when the caller recorded it.</summary>
+    public string? Details { get; init; }
 }
