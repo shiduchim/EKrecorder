@@ -113,7 +113,8 @@ internal sealed class SelfTest : ApplicationContext
         saved = null;
         RecordingSession? fallback = await RecordAsync(controller, TimeSpan.FromSeconds(3), simulateFailure: true);
         bool reported = fallback?.SetupFailures.Contains("simulated by the self-test", StringComparison.Ordinal) == true;
-        VerifyRecording("Recording after a refused first set-up", saved, fallback, minimumSeconds: 2, extraCheck: reported, extraDetail: $"set-up failure reported: {reported}");
+        // The refused set-up is tried again with a regular MP4 before the next way of recording is tried.
+        VerifyRecording("Recording after a refused first set-up", saved, fallback, minimumSeconds: 2, extraCheck: reported, extraDetail: $"set-up failure reported: {reported}", expectFragmented: false);
 
         // 3. The PC "dies" mid-recording: a copy of the file as it is at that moment must be recoverable.
         saved = null;
@@ -199,7 +200,8 @@ internal sealed class SelfTest : ApplicationContext
         return session;
     }
 
-    private void VerifyRecording(string name, string? path, RecordingSession? session, double minimumSeconds, bool extraCheck = true, string? extraDetail = null)
+    private void VerifyRecording(
+        string name, string? path, RecordingSession? session, double minimumSeconds, bool extraCheck = true, string? extraDetail = null, bool expectFragmented = true)
     {
         if (session is null || path is null || !File.Exists(path))
         {
@@ -221,10 +223,11 @@ internal sealed class SelfTest : ApplicationContext
             regular = Mp4Scanner.Scan(stream) is { Kind: Mp4Kind.Regular } layout && layout.TopLevel.All(b => b.Type != "moof");
         }
 
-        bool passed = summary.Ok && check.Readable && video is not null && video.Seconds >= minimumSeconds && Math.Abs(fps - 30) < 0.6
-            && audioMatches && inFolder && inProgressEmpty && regular && session.IsFragmented && extraCheck;
+        string? playback = Mp4Inspector.QuickCheck(path);
+        bool passed = summary.Ok && check.Readable && playback is null && video is not null && video.Seconds >= minimumSeconds && Math.Abs(fps - 30) < 0.6
+            && audioMatches && inFolder && inProgressEmpty && regular && session.IsFragmented == expectFragmented && extraCheck;
         Result(name, passed, Invariant(
-            $"{RecordingFinisher.Describe(summary)}; fps {fps:0.00}; Windows read {check.Frames} frames and {check.Audio.Describe()}; fragmented while recording {session.IsFragmented}; regular MP4 now {regular}; in EKrecordings {inFolder}; InProgress empty {inProgressEmpty}; {session.FramePath}{(extraDetail is null ? "" : "; " + extraDetail)}"));
+            $"{RecordingFinisher.Describe(summary)}; fps {fps:0.00}; Windows read {check.Frames} frames and {check.Audio.Describe()}; quick playback check: {playback ?? "plays"}; fragmented while recording {session.IsFragmented}; regular MP4 now {regular}; in EKrecordings {inFolder}; InProgress empty {inProgressEmpty}; {session.FramePath}{(extraDetail is null ? "" : "; " + extraDetail)}"));
     }
 
     private void SyncCheck(string name, Func<SyncResult> run, bool required)

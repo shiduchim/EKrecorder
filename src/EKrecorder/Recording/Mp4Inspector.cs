@@ -189,59 +189,72 @@ internal static unsafe class Mp4Inspector
     /// <summary>
     /// Opens the file the way Windows' own players do, reads the first picture and the first sound, then jumps near
     /// the end and reads a picture there. Fast for any length. Null when all of that works, else what failed.
+    /// Video and sound are read with separate readers (switching streams on one reader mid-way is unreliable).
     /// </summary>
     public static string? QuickCheck(string path)
     {
-        IMFSourceReader* reader = null;
         try
         {
             EnsureStarted();
+            string? video = CheckStream(path, MF_SOURCE_READER_FIRST_VIDEO_STREAM, seekNearEnd: true);
+            if (video is not null)
+            {
+                return video;
+            }
+
+            return CheckStream(path, MF_SOURCE_READER_FIRST_AUDIO_STREAM, seekNearEnd: false);
+        }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    private static string? CheckStream(string path, uint stream, bool seekNearEnd)
+    {
+        bool video = stream == MF_SOURCE_READER_FIRST_VIDEO_STREAM;
+        IMFSourceReader* reader = null;
+        try
+        {
             fixed (char* file = path)
             {
                 Check(MFCreateSourceReaderFromURL(file, null, &reader), "MFCreateSourceReaderFromURL");
             }
 
+            reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+            if (reader->SetStreamSelection(stream, TRUE).FAILED)
+            {
+                // A file without a sound track is reported by the full check, not here.
+                return video ? "the file has no video track" : null;
+            }
+
+            if (!ReadOne(reader, stream))
+            {
+                return video ? "no picture could be read" : "no sound could be read";
+            }
+
             long duration = 0;
             PROPVARIANT value = default;
-            if (reader->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, Ptr(in MF.MF_PD_DURATION), &value).SUCCEEDED)
+            if (seekNearEnd && reader->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, Ptr(in MF.MF_PD_DURATION), &value).SUCCEEDED)
             {
                 duration = (long)*(ulong*)((byte*)&value + 8);
                 PropVariantClear(&value);
             }
 
-            reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-            Check(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE), "IMFSourceReader::SetStreamSelection(video)");
-            if (!ReadOne(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM))
-            {
-                return "no picture could be read";
-            }
-
-            reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, FALSE);
-            if (reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE).SUCCEEDED && !ReadOne(reader, MF_SOURCE_READER_FIRST_AUDIO_STREAM))
-            {
-                return "no sound could be read";
-            }
-
             if (duration > 30_000_000)
             {
-                reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-                reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
                 PROPVARIANT position = default;
                 *(ushort*)&position = 20; // VT_I8
                 *(long*)((byte*)&position + 8) = duration - 20_000_000;
                 Guid timeFormat = Guid.Empty;
                 Check(reader->SetCurrentPosition(&timeFormat, &position), "IMFSourceReader::SetCurrentPosition");
-                if (!ReadOne(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM))
+                if (!ReadOne(reader, stream))
                 {
                     return "the end of the file could not be read";
                 }
             }
 
             return null;
-        }
-        catch (Exception ex)
-        {
-            return ex.Message;
         }
         finally
         {
