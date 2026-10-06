@@ -17,6 +17,7 @@
     <Compile Include="..\..\src\EKrecorder\Audio\SampleConverter.cs" Link="Linked\SampleConverter.cs" />
     <Compile Include="..\..\src\EKrecorder\Audio\AudioMix.cs" Link="Linked\AudioMix.cs" />
     <Compile Include="..\..\src\EKrecorder\Recording\RecordingPreset.cs" Link="Linked\RecordingPreset.cs" />
+    <Compile Include="..\..\src\EKrecorder\Mp4\*.cs" Link="Linked\Mp4\%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>
