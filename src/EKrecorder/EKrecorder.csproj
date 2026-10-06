@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- .NET 10 with the Windows 11 24H2 SDK projections (Windows.Graphics.Capture and friends). -->
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <!-- Windows 11 only. Newer APIs (for example MinUpdateInterval) are checked at runtime before use. -->
+    <SupportedOSPlatformVersion>10.0.22000.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- ApplicationConfiguration.Initialize() applies this before any window exists. -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationVisualStyles>true</ApplicationVisualStyles>
+    <ApplicationUseCompatibleTextRendering>false</ApplicationUseCompatibleTextRendering>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- COM vtable calls for DXGI and the capture interop interface. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>EKrecorder</RootNamespace>
+    <AssemblyName>EKrecorder</AssemblyName>
+    <Product>EKrecorder</Product>
+    <AssemblyTitle>EKrecorder capture spike</AssemblyTitle>
+    <Version>0.1.0</Version>
+    <InformationalVersion>0.1.0-spike1</InformationalVersion>
+    <!-- Line numbers in logged stack traces, also from the single-file build. -->
+    <DebugType>embedded</DebugType>
+    <!-- Lets the project compile on Linux/macOS too (CI and quick checks); harmless on Windows. -->
+    <EnableWindowsTargeting Condition="'$(OS)' != 'Windows_NT'">true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+</Project>

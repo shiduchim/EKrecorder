@@ -1,0 +1,98 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build, self-test and package
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build the solution (Debug and Release)
+        shell: pwsh
+        run: |
+          dotnet build EKrecorder.sln -c Debug
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build EKrecorder.sln -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish one self-contained EKrecorder.exe (win-x64)
+        shell: pwsh
+        run: |
+          dotnet publish src/EKrecorder/EKrecorder.csproj -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true `
+            -o publish/EKrecorder
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item docs/HOW-TO-RUN.txt publish/EKrecorder/
+          Get-ChildItem publish/EKrecorder | Format-Table Name, Length -AutoSize
+
+      # Runs the same 10-second test on the build machine's virtual screen, without questions. It shows whether the
+      # app starts and the Windows APIs answer on a real Windows. It never blocks the download below: the build
+      # machine has no real monitor or GPU, so the test on your own PC is the one that counts.
+      - name: Self-test on the build machine (informational)
+        id: selftest
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = (Resolve-Path 'publish/EKrecorder/EKrecorder.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList @('--selftest', '--output', "`"$out`"") -PassThru
+          $null = $p.Handle  # keeps ExitCode readable after the process ends
+          if (-not $p.WaitForExit(240000)) {
+            Stop-Process -Id $p.Id -Force
+            Write-Host '::warning::The self-test did not finish within 4 minutes.'
+          }
+          $p.WaitForExit()
+          $code = $p.ExitCode
+          foreach ($name in 'report.txt', 'log.txt') {
+            $file = Get-ChildItem $out -Recurse -Filter $name | Select-Object -First 1
+            if ($file) { Write-Host "===== $name ====="; Get-Content $file.FullName | Write-Host }
+          }
+          if (-not (Get-ChildItem $out -Recurse -Filter report.txt)) {
+            Write-Host '===== session log (no report was written) ====='
+            Get-ChildItem "$env:LOCALAPPDATA\EKrecorder\Logs" -Filter *.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-Content $_.FullName | Write-Host }
+          }
+          Write-Host "Self-test exit code: $code"
+          exit $code
+
+      - name: Upload EKrecorder (this is the one to download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: EKrecorder-spike-win-x64
+          path: publish/EKrecorder/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the self-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-results
+          path: ${{ runner.temp }}/selftest/
+          if-no-files-found: ignore
+          retention-days: 14
