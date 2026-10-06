@@ -25,10 +25,16 @@ internal sealed record EncoderInfo(
 }
 
 /// <summary>
-/// H.264 in MP4 through the Media Foundation sink writer. <see cref="Create"/> either allows hardware encoders (the sink
-/// writer then loads one if the PC has one) or uses the software encoder only. Rate control is tried in order:
-/// peak-constrained VBR (2 Mbps average, 6 Mbps peak), unconstrained VBR, CBR, then the same on Main profile, then
-/// encoder defaults.
+/// H.264 video and AAC audio in MP4 through the Media Foundation sink writer. <see cref="Create"/> either allows
+/// hardware video encoders (the sink writer then loads one if the PC has one) or uses the software encoder only.
+/// Rate control is tried in order: peak-constrained VBR (2 Mbps average, 6 Mbps peak), unconstrained VBR, CBR, then
+/// the same on Main profile, then encoder defaults. Audio is AAC-LC, 48 kHz stereo, 128 kbps; if the AAC encoder
+/// cannot be set up the file is written without audio and <see cref="AudioError"/> says why.
+/// <para>
+/// Video and audio arrive from different threads. Every call into the sink writer is serialized here, and the sink
+/// writer's throttling is off: otherwise it may hold the video thread until the (deliberately later) audio catches
+/// up.
+/// </para>
 /// </summary>
 internal sealed unsafe class H264Mp4Writer : IDisposable
 {
@@ -36,15 +42,28 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     private const uint MFT_ENUM_FLAG_SORTANDFILTER = 0x40;
     private const int E_INVALIDARG = unchecked((int)0x80070057);
 
+    private const uint NoStream = uint.MaxValue;
+
+    private readonly object _gate = new();
     private readonly uint _stream;
+    private readonly uint _audioStream;
     private IMFSinkWriter* _writer;
 
-    private H264Mp4Writer(IMFSinkWriter* writer, uint stream, string inputType)
+    private H264Mp4Writer(IMFSinkWriter* writer, uint stream, uint audioStream, string inputType)
     {
         _writer = writer;
         _stream = stream;
+        _audioStream = audioStream;
         InputType = inputType;
     }
+
+    /// <summary>True when the file has an AAC audio track.</summary>
+    public bool HasAudio => _audioStream != NoStream;
+
+    /// <summary>Why the file has no audio track, when audio was wanted but the AAC encoder could not be set up.</summary>
+    public string? AudioError { get; private set; }
+
+    public static string AudioFormat => "AAC-LC, 48000 Hz, stereo, 128 kbps";
 
     public EncoderInfo Encoder { get; private set; } = new(false, "unknown", "unknown", "", "", "", "", "", "", "");
 
@@ -96,16 +115,28 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     /// Opens <paramref name="path"/> for writing. <paramref name="manager"/> may be null (memory frames; a hardware
     /// encoder then uses its own GPU device). <paramref name="gpuInput"/>: frames will arrive as GPU textures.
     /// <paramref name="hardwareAllowed"/>: false uses the Microsoft software encoder only.
+    /// <paramref name="withAudio"/>: add the AAC track (dropped, with <see cref="AudioError"/>, if it cannot be set up).
     /// </summary>
     public static H264Mp4Writer Create(
-        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter)
+        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter, bool withAudio)
     {
         var failures = new List<string>();
+        string? audioError = null;
         foreach (Plan plan in Plans(preset))
         {
-            H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, out string failure);
+            H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, withAudio, out string failure, out bool audioFailed);
+            if (writer is null && withAudio && audioFailed)
+            {
+                // The video side was fine; record without audio rather than not at all, and say so loudly.
+                audioError = failure;
+                withAudio = false;
+                Log.Error($"The AAC audio track could not be set up ({failure}); recording video without audio.");
+                writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, false, out failure, out _);
+            }
+
             if (writer is not null)
             {
+                writer.AudioError = audioError;
                 writer.Identify(plan, preset, adapter);
                 writer.ReadEncoderInput();
                 return writer;
@@ -136,7 +167,10 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
         else
         {
-            hr = _writer->WriteSample(_stream, sample);
+            lock (_gate)
+            {
+                hr = _writer == null ? unchecked((int)0x80004005) /* E_FAIL: closed */ : _writer->WriteSample(_stream, sample);
+            }
         }
 
         if (hr.FAILED)
@@ -174,19 +208,96 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Writes one chunk of 16-bit stereo PCM (from the audio mixer thread) at <paramref name="time"/> in the file.
+    /// </summary>
+    public void WriteAudio(ReadOnlySpan<short> interleaved, long time, long duration)
+    {
+        if (!HasAudio)
+        {
+            return;
+        }
+
+        uint bytes = (uint)(interleaved.Length * sizeof(short));
+        IMFMediaBuffer* buffer;
+        Check(MFCreateMemoryBuffer(bytes, &buffer), "MFCreateMemoryBuffer(audio)");
+        IMFSample* sample = null;
+        try
+        {
+            byte* data;
+            uint maximum;
+            uint current;
+            Check(buffer->Lock(&data, &maximum, &current), "IMFMediaBuffer::Lock(audio)");
+            interleaved.CopyTo(new Span<short>(data, interleaved.Length));
+            Check(buffer->Unlock(), "IMFMediaBuffer::Unlock(audio)");
+            Check(buffer->SetCurrentLength(bytes), "IMFMediaBuffer::SetCurrentLength(audio)");
+            Check(MFCreateSample(&sample), "MFCreateSample(audio)");
+            Check(sample->AddBuffer(buffer), "IMFSample::AddBuffer(audio)");
+            Check(sample->SetSampleTime(time), "IMFSample::SetSampleTime(audio)");
+            Check(sample->SetSampleDuration(duration), "IMFSample::SetSampleDuration(audio)");
+            lock (_gate)
+            {
+                if (_writer == null)
+                {
+                    throw new ObjectDisposedException(nameof(H264Mp4Writer), "the file is already closed");
+                }
+
+                Check(_writer->WriteSample(_audioStream, sample), "IMFSinkWriter::WriteSample(audio)");
+            }
+        }
+        finally
+        {
+            buffer->Release();
+            if (sample != null)
+            {
+                sample->Release();
+            }
+        }
+    }
+
     /// <summary>The sink writer's own counters for the report.</summary>
     public string Statistics()
     {
-        MF_SINK_WRITER_STATISTICS statistics = default;
-        statistics.cb = (uint)sizeof(MF_SINK_WRITER_STATISTICS);
-        HRESULT hr = _writer->GetStatistics(_stream, &statistics);
-        return hr.FAILED
-            ? $"not available ({Describe(hr)})"
-            : $"{statistics.qwNumSamplesReceived} frames received, {statistics.qwNumSamplesEncoded} encoded, {statistics.qwNumSamplesProcessed} written to the file";
+        lock (_gate)
+        {
+            MF_SINK_WRITER_STATISTICS statistics = default;
+            statistics.cb = (uint)sizeof(MF_SINK_WRITER_STATISTICS);
+            HRESULT hr = _writer->GetStatistics(_stream, &statistics);
+            return hr.FAILED
+                ? $"not available ({Describe(hr)})"
+                : $"{statistics.qwNumSamplesReceived} frames received, {statistics.qwNumSamplesEncoded} encoded, {statistics.qwNumSamplesProcessed} written to the file";
+        }
+    }
+
+    /// <summary>The sink writer's counters for the audio track.</summary>
+    public string AudioStatistics()
+    {
+        if (!HasAudio)
+        {
+            return "no audio track";
+        }
+
+        lock (_gate)
+        {
+            MF_SINK_WRITER_STATISTICS statistics = default;
+            statistics.cb = (uint)sizeof(MF_SINK_WRITER_STATISTICS);
+            HRESULT hr = _writer->GetStatistics(_audioStream, &statistics);
+            return hr.FAILED
+                ? $"not available ({Describe(hr)})"
+                : $"{statistics.qwNumSamplesReceived} chunks received, {statistics.qwNumSamplesEncoded} encoded, {statistics.qwNumSamplesProcessed} written to the file";
+        }
     }
 
     /// <summary>Everything about the encoder and the media types on both sides of it, for a failure report.</summary>
     public string Diagnostics()
+    {
+        lock (_gate)
+        {
+            return DiagnosticsLocked();
+        }
+    }
+
+    private string DiagnosticsLocked()
     {
         var text = new StringBuilder();
         text.AppendLine($"Encoder: {Encoder.Summary} - \"{Encoder.Name}\" (identified by {Encoder.IdentifiedBy}); settings requested: {Encoder.Plan}");
@@ -221,15 +332,25 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         return text.ToString();
     }
 
-    /// <summary>Drains the encoder and writes the MP4 index. Without this the file cannot be played.</summary>
-    public void FinishFile() => Check(_writer->Finalize(), "IMFSinkWriter::Finalize");
+    /// <summary>Drains the encoders and writes the MP4 index. Without this the file cannot be played.</summary>
+    public void FinishFile()
+    {
+        lock (_gate)
+        {
+            Check(_writer->Finalize(), "IMFSinkWriter::Finalize");
+        }
+    }
 
     public void Dispose()
     {
-        if (_writer != null)
+        // Under the lock: a late audio chunk from the mixer must find the writer either open or gone, never half.
+        lock (_gate)
         {
-            _writer->Release();
-            _writer = null;
+            if (_writer != null)
+            {
+                _writer->Release();
+                _writer = null;
+            }
         }
     }
 
@@ -246,18 +367,27 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     }
 
     private static H264Mp4Writer? TryCreate(
-        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardware, Plan plan, out string failure)
+        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardware, Plan plan, bool withAudio, out string failure, out bool audioFailed)
     {
         failure = "";
+        audioFailed = false;
         TryDelete(path);
         IMFAttributes* attributes = null;
         IMFSinkWriter* writer = null;
         IMFMediaType* outputType = null;
         IMFMediaType* inputType = null;
+        IMFMediaType* audioOutputType = null;
+        IMFMediaType* audioInputType = null;
         IMFAttributes* encoderSettings = null;
         try
         {
-            Check(MFCreateAttributes(&attributes, 4), "MFCreateAttributes");
+            Check(MFCreateAttributes(&attributes, 5), "MFCreateAttributes");
+            if (withAudio)
+            {
+                // Audio comes from its own thread, deliberately later than the video; never block either side.
+                Check(attributes->SetUINT32(Ptr(in MF.MF_SINK_WRITER_DISABLE_THROTTLING), 1), "set MF_SINK_WRITER_DISABLE_THROTTLING");
+            }
+
             if (manager != null)
             {
                 // GPU textures go straight to the encoder; hardware encoders run on the same device.
@@ -294,10 +424,28 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
 
             // The sink writer creates the encoder here and hands it the settings through ICodecAPI.
             Check(writer->SetInputMediaType(stream, inputType, encoderSettings), "IMFSinkWriter::SetInputMediaType");
+
+            uint audioStream = NoStream;
+            if (withAudio)
+            {
+                try
+                {
+                    audioOutputType = CreateAudioType(in MFAudioFormat.MFAudioFormat_AAC, aac: true);
+                    Check(writer->AddStream(audioOutputType, &audioStream), "IMFSinkWriter::AddStream(AAC)");
+                    audioInputType = CreateAudioType(in MFAudioFormat.MFAudioFormat_PCM, aac: false);
+                    Check(writer->SetInputMediaType(audioStream, audioInputType, null), "IMFSinkWriter::SetInputMediaType(PCM to AAC)");
+                }
+                catch (MediaFoundationException)
+                {
+                    audioFailed = true;
+                    throw;
+                }
+            }
+
             Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
-            Log.Info($"Sink writer ready: {plan.Name}, {(hardware ? "hardware encoders allowed" : "software only")}, {(gpuInput ? "GPU textures in" : "memory frames in")}");
+            Log.Info($"Sink writer ready: {plan.Name}, {(hardware ? "hardware encoders allowed" : "software only")}, {(gpuInput ? "GPU textures in" : "memory frames in")}{(withAudio ? $", audio {AudioFormat}" : ", no audio")}");
             Log.Info($"Input media type: {inputDescription}");
-            var result = new H264Mp4Writer(writer, stream, inputDescription);
+            var result = new H264Mp4Writer(writer, stream, audioStream, inputDescription);
             writer = null;
             return result;
         }
@@ -309,6 +457,16 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
         }
         finally
         {
+            if (audioInputType != null)
+            {
+                audioInputType->Release();
+            }
+
+            if (audioOutputType != null)
+            {
+                audioOutputType->Release();
+            }
+
             if (encoderSettings != null)
             {
                 encoderSettings->Release();
@@ -334,6 +492,40 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             {
                 attributes->Release();
             }
+        }
+    }
+
+    /// <summary>48 kHz stereo audio: AAC-LC at 128 kbps (the file's track), or 16-bit PCM (what the mixer delivers).</summary>
+    private static IMFMediaType* CreateAudioType(in Guid subtype, bool aac)
+    {
+        IMFMediaType* type;
+        Check(MFCreateMediaType(&type), "MFCreateMediaType(audio)");
+        try
+        {
+            Check(type->SetGUID(Ptr(in MF.MF_MT_MAJOR_TYPE), Ptr(in MFMediaType_Audio)), "set MF_MT_MAJOR_TYPE(audio)");
+            Check(type->SetGUID(Ptr(in MF.MF_MT_SUBTYPE), Ptr(in subtype)), "set MF_MT_SUBTYPE(audio)");
+            Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_BITS_PER_SAMPLE), 16), "set MF_MT_AUDIO_BITS_PER_SAMPLE");
+            Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_SAMPLES_PER_SECOND), 48_000), "set MF_MT_AUDIO_SAMPLES_PER_SECOND");
+            Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_NUM_CHANNELS), 2), "set MF_MT_AUDIO_NUM_CHANNELS");
+            if (aac)
+            {
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_AVG_BYTES_PER_SECOND), 16_000), "set MF_MT_AUDIO_AVG_BYTES_PER_SECOND");
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_AAC_PAYLOAD_TYPE), 0), "set MF_MT_AAC_PAYLOAD_TYPE");
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION), 0x29), "set MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION");
+            }
+            else
+            {
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_BLOCK_ALIGNMENT), 4), "set MF_MT_AUDIO_BLOCK_ALIGNMENT");
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_AUDIO_AVG_BYTES_PER_SECOND), 48_000 * 4), "set MF_MT_AUDIO_AVG_BYTES_PER_SECOND");
+                Check(type->SetUINT32(Ptr(in MF.MF_MT_ALL_SAMPLES_INDEPENDENT), 1), "set MF_MT_ALL_SAMPLES_INDEPENDENT");
+            }
+
+            return type;
+        }
+        catch
+        {
+            type->Release();
+            throw;
         }
     }
 

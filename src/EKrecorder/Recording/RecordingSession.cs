@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using EKrecorder.Audio;
 using EKrecorder.Capture;
 using EKrecorder.Diagnostics;
 using EKrecorder.Monitors;
@@ -23,6 +24,11 @@ namespace EKrecorder.Recording;
 /// Everything runs on one dedicated thread that paces the output at the preset frame rate (15 fps) on the
 /// QueryPerformanceCounter clock. Each tick encodes the newest captured frame, or the previous one again when the
 /// screen has not changed, so the file has a constant frame rate.
+/// </para>
+/// <para>
+/// Audio (microphone and computer audio, see <see cref="AudioCapture"/>) starts before the video set-up so the
+/// devices are open in time. Its timeline starts with video frame 0, on the same QPC clock, and the mixer ends it
+/// exactly with the last video frame.
 /// </para>
 /// <para>
 /// How frames reach the encoder is chosen at the start, best first: GPU frames into a hardware encoder (nothing leaves
@@ -48,6 +54,7 @@ internal sealed unsafe class RecordingSession
     private readonly TaskCompletionSource _finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string _borderlessAccess;
     private readonly bool _simulateFirstSetupFailure;
+    private readonly AudioSelection? _audioSelection;
     private readonly List<string> _fallbacks = new();
     private readonly StringBuilder _setupFailures = new();
     private HeldFrame? _latest;
@@ -60,8 +67,9 @@ internal sealed unsafe class RecordingSession
     private volatile bool _stopRequested;
     private volatile bool _itemClosed;
 
-    private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, bool simulateFirstSetupFailure)
+    private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio, bool simulateFirstSetupFailure)
     {
+        _audioSelection = audio;
         Monitor = monitor;
         Preset = preset;
         TemporaryPath = temporaryPath;
@@ -91,6 +99,9 @@ internal sealed unsafe class RecordingSession
 
     public string WriterStatistics { get; private set; } = "";
 
+    /// <summary>The sink writer's counters for the audio track.</summary>
+    public string AudioStatistics { get; private set; } = "";
+
     public IReadOnlyList<string> HardwareEncoders { get; private set; } = [];
 
     public EncoderInfo? Encoder { get; private set; }
@@ -119,6 +130,21 @@ internal sealed unsafe class RecordingSession
     /// <summary>What the encoder's input stream asks of its samples (IMFTransform::GetInputStreamAttributes).</summary>
     public string EncoderInputStream { get; private set; } = "";
 
+    /// <summary>The microphone and computer-audio capture (null when recording without audio).</summary>
+    public AudioCapture? Audio { get; private set; }
+
+    /// <summary>The audio mixer (null until the recording runs, or without an audio track).</summary>
+    public AudioMixer? Mixer { get; private set; }
+
+    /// <summary>Why the file has no audio track, when it should have one.</summary>
+    public string? AudioError { get; private set; }
+
+    /// <summary>
+    /// How much later than captured the audio is placed: half a video frame, the average age of the screen picture
+    /// a video frame shows (the newest captured frame at that moment), so sound and picture line up on average.
+    /// </summary>
+    public TimeSpan AudioOffset => TimeSpan.FromTicks(TimeSpan.TicksPerSecond / (2 * Preset.FramesPerSecond));
+
     /// <summary>Output frames so far (slot count, including dropped ones, decides the duration).</summary>
     public long Slots { get; private set; }
 
@@ -131,13 +157,14 @@ internal sealed unsafe class RecordingSession
 
     /// <summary>
     /// Starts recording; returns once the first frame has been captured and accepted by the encoder.
+    /// <paramref name="audio"/>: which microphone and computer audio to record (null: no audio track).
     /// <paramref name="simulateFirstSetupFailure"/> (self-test only) makes the first set-up's first frame fail, to
     /// prove that the next set-up takes over and that the failure is reported.
     /// </summary>
     public static Task<RecordingSession> StartAsync(
-        MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, bool simulateFirstSetupFailure = false)
+        MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio, bool simulateFirstSetupFailure = false)
     {
-        var session = new RecordingSession(monitor, preset, temporaryPath, borderlessAccess, simulateFirstSetupFailure);
+        var session = new RecordingSession(monitor, preset, temporaryPath, borderlessAccess, audio, simulateFirstSetupFailure);
         var thread = new Thread(session.Run)
         {
             Name = "EKrecorder recording",
@@ -194,6 +221,12 @@ internal sealed unsafe class RecordingSession
                 + (OutputSize == CaptureSize ? "(no scaling)." : "(scaled down, aspect ratio kept, never upscaled)."));
 
             HardwareEncoders = H264Mp4Writer.ListHardwareEncoders();
+            if (_audioSelection is not null)
+            {
+                // The devices open in the background while the video is set up (a Bluetooth headset can take a while).
+                Audio = new AudioCapture(_audioSelection, forRecording: true);
+                Audio.Start();
+            }
 
             pool = Direct3D11CaptureFramePool.CreateFreeThreaded(device.Device, DirectXPixelFormat.B8G8R8A8UIntNormalized, PoolBuffers, item.Size);
             session = pool.CreateCaptureSession(item);
@@ -207,6 +240,7 @@ internal sealed unsafe class RecordingSession
             }
 
             route = OpenRoute(device, d3dDevice, out long firstFrameWritten);
+            StartAudioTimeline(route, firstFrameWritten);
             started = true;
             _started.TrySetResult(this);
             RunFrames(route, adapter3, firstFrameWritten);
@@ -268,6 +302,7 @@ internal sealed unsafe class RecordingSession
                 _latest = null;
             }
 
+            FinishAudio();
             if (route != null)
             {
                 CloseRoute(route);
@@ -382,6 +417,55 @@ internal sealed unsafe class RecordingSession
         throw new InvalidOperationException($"No way to record could be set up. {string.Join(" | ", _fallbacks)}");
     }
 
+    /// <summary>
+    /// Starts the audio timeline at video frame 0 (minus <see cref="AudioOffset"/>) and the mixer that feeds the
+    /// file's audio track.
+    /// </summary>
+    private void StartAudioTimeline(Route route, long firstFrameWritten)
+    {
+        if (Audio is null)
+        {
+            return;
+        }
+
+        long startHns = TimelineClock.ToHns(firstFrameWritten, Stopwatch.Frequency) - AudioOffset.Ticks;
+        var clock = new TimelineClock(startHns);
+        Audio.BeginTimeline(clock);
+        if (!route.Writer.HasAudio)
+        {
+            AudioError = route.Writer.AudioError ?? "the file has no audio track";
+            Stats.AddError($"No audio track: {AudioError}");
+            return;
+        }
+
+        Mixer = new AudioMixer(Audio.Rings, clock, route.Writer.WriteAudio);
+        Mixer.Start();
+    }
+
+    /// <summary>Writes the audio to the end of the last video frame, then closes the audio devices.</summary>
+    private void FinishAudio()
+    {
+        try
+        {
+            if (Mixer is not null)
+            {
+                long endFrame = Slots * TimelineClock.SampleRate / Preset.FramesPerSecond;
+                Mixer.Finish(endFrame, TimeSpan.FromSeconds(5));
+                if (Mixer.Error is not null)
+                {
+                    Stats.AddError($"The audio track ended early: {Mixer.Error}");
+                }
+            }
+
+            Audio?.Stop();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Finishing the audio failed", ex);
+            Stats.AddError($"Finishing the audio failed: {ex.Message}");
+        }
+    }
+
     /// <summary>GPU frames into a hardware encoder, or null (with the reason in <see cref="Fallbacks"/>).</summary>
     private Route? TryOpenGpuRoute(CaptureDevice device, ID3D11Device* d3dDevice)
     {
@@ -404,7 +488,7 @@ internal sealed unsafe class RecordingSession
                 return null;
             }
 
-            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter);
+            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter, withAudio: Audio is not null);
             if (!writer.Encoder.IsHardware)
             {
                 Fallback(GpuSetup, "no hardware encoder accepted the settings (GPU frames are only used with a hardware encoder)");
@@ -445,7 +529,7 @@ internal sealed unsafe class RecordingSession
         try
         {
             // No device manager: a hardware encoder then takes frames from memory and runs on its own GPU device.
-            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter);
+            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter, withAudio: Audio is not null);
             var route = new Route(hardware ? CpuHardwareSetup : CpuSoftwareSetup, writer, null, null, cpu, null);
             cpu = null;
             return route;
@@ -559,6 +643,7 @@ internal sealed unsafe class RecordingSession
     private void CloseRoute(Route route)
     {
         WriterStatistics = route.Writer.Statistics();
+        AudioStatistics = route.Writer.AudioStatistics();
         GpuSamples = route.Samples?.Summary ?? "";
         if (Stats.FramesWritten > 0)
         {

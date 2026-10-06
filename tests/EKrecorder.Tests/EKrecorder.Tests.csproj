@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>EKrecorder.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The audio timing code and the output-size rule have no Windows dependencies, so they are compiled
+         straight into the tests, which then run on any OS. -->
+    <Compile Include="..\..\src\EKrecorder\Audio\AudioTimeline.cs" Link="Linked\AudioTimeline.cs" />
+    <Compile Include="..\..\src\EKrecorder\Audio\TimelineWriter.cs" Link="Linked\TimelineWriter.cs" />
+    <Compile Include="..\..\src\EKrecorder\Audio\SampleConverter.cs" Link="Linked\SampleConverter.cs" />
+    <Compile Include="..\..\src\EKrecorder\Audio\AudioMix.cs" Link="Linked\AudioMix.cs" />
+    <Compile Include="..\..\src\EKrecorder\Recording\RecordingPreset.cs" Link="Linked\RecordingPreset.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="System.Drawing" />
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

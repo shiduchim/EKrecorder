@@ -3,7 +3,33 @@
 A Windows 11 screen recorder (C#, WinForms, .NET 10).
 
 This repository holds the test build. **Step 1** (done) proved the monitor, capture and triangle architecture.
-**Step 2** (this build) adds the video recording engine. Video only: no microphone or computer sound yet.
+**Step 2** (done) added the video recording engine. **Step 3** (this build) adds reliable microphone and computer
+audio.
+
+## What Step 3 adds: audio that survives device changes
+
+- Records the **microphone** and the **computer audio** (WASAPI loopback, shared mode, event-driven) and mixes them
+  into the MP4 as one AAC track: 48 kHz stereo, 128 kbps. The microphone is mono, centred; computer audio is stereo.
+  Mixing is in floating point, followed by a -1 dBFS peak limiter, so the mix never clips.
+- **Devices.** Microphone: Windows' default *communications* microphone, or a selected one. Computer audio: Windows'
+  default output *and* default communications output (captured once when they are the same device), or a selected
+  one. No other device is captured, so virtual routing devices cannot double the sound.
+- **A lost device never stops the recording.** Each input has its own state machine (Resolving → Running → Lost →
+  Retrying → Running). While a device is missing, its part of the mix is silence. Windows' device notifications
+  (IMMNotificationClient) are handed to a supervisor thread, which waits 500 ms for a burst of changes to settle and
+  retries after 250 ms, 500 ms, 1 s, then every 2 s. It follows a new Windows default during the recording; a selected
+  device that disappears is replaced by the default until it comes back. When switching, the old device keeps
+  recording until the new one runs.
+- **Timing.** Audio is placed by each packet's QPC timestamp on the same clock that paces the video, never by
+  counting packets. Silence (a loopback device sends nothing while nothing plays) keeps its real length, and each
+  device's clock drift is corrected continuously by a small resampler (at most ±0.5 % speed). The unit tests simulate
+  two hours with ±150 ppm drift and timestamp jitter: the audio stays within 0.03 ms of true time.
+- **Safety margins.** 500 ms WASAPI buffers, mixing 600 ms behind real time, no allocations in the capture path,
+  capture and mix threads registered with MMCSS.
+- **Health.** The window shows each input's level, state and devices. A microphone that sends nothing but exact digital
+  silence for 8 seconds raises a warning (muted, or blocked by Windows privacy settings?); computer-audio silence is
+  normal. The report lists every audio event with its recording time.
+- Devices are open only while recording, or while "Show audio meters" is ticked and the window is not minimized.
 
 ## What Step 2 does
 
@@ -25,7 +51,7 @@ This repository holds the test build. **Step 1** (done) proved the monitor, capt
 - After each recording, opens a report: encoder used, output resolution, frame rate, file size, average and peak
   bitrate measured from the file, keyframes, dropped and duplicated frames, errors, CPU and memory use.
 
-Not in this build, on purpose: microphone, computer audio, hotkey, start with Windows, tray, crash recovery, settings,
+Not in this build, on purpose: hotkey, start with Windows, tray, the orange triangle, crash recovery, settings,
 installer.
 
 ## Run it on your PC
@@ -36,9 +62,10 @@ installer.
 4. Right-click the zip, choose **Extract All**, and open the extracted folder.
 5. Double-click **EKrecorder.exe**. If Windows says "Windows protected your PC", click **More info**, then
    **Run anyway** (the test build is not signed).
-6. Pick a monitor, click **Start recording**, use the PC for 1–2 minutes, then click **Stop recording**.
+6. Pick a monitor and the audio devices (the Windows defaults are right for most tests), click **Start recording**,
+   use the PC for 1–2 minutes, then click **Stop recording**.
 7. The video is in Desktop > EKrecordings. The report opens in Notepad: paste its **SUMMARY** part into our chat.
-   If the report has a **FAILURE DETAILS** part, paste the whole report.
+   If the report has a **FAILURE DETAILS** part, paste the whole report. For audio tests, add the **AUDIO EVENTS**.
 
 ## Build it yourself
 
@@ -68,3 +95,9 @@ The workflow in `.github/workflows/build.yml` builds on Windows, publishes one s
 | `src/EKrecorder/Recording/H264Mp4Writer.cs` | Media Foundation H.264 → MP4, encoder choice and settings |
 | `src/EKrecorder/Recording/MediaFoundationDiagnostics.cs` | Samples, textures and media types as text, for the report |
 | `src/EKrecorder/Recording/RecordingReport.cs` | Moves the finished file, reads it back, writes the report |
+| `src/EKrecorder/Audio/AudioCapture.cs` | The audio supervisor: devices, notifications, per-input state machines, retries |
+| `src/EKrecorder/Audio/CaptureWorker.cs` | One WASAPI capture stream (microphone or loopback) on its own thread |
+| `src/EKrecorder/Audio/TimelineWriter.cs` | Places a stream on the QPC timeline and corrects its clock drift |
+| `src/EKrecorder/Audio/AudioTimeline.cs` | The timeline clock and each stream's buffer on it |
+| `src/EKrecorder/Audio/AudioMixer.cs` | Sums the streams, limits, and feeds the AAC encoder |
+| `tests/EKrecorder.Tests/` | Unit tests: hours of simulated drift, jitter, silence and lost devices |

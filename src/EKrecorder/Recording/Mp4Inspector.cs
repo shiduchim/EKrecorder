@@ -20,7 +20,18 @@ internal sealed record Mp4Check(
     double AverageKeyframeSpacing,
     long FileBytes,
     double AverageBitsPerSecond,
-    double PeakBitsPerSecond);
+    double PeakBitsPerSecond,
+    AudioTrackCheck Audio);
+
+/// <summary>The file's audio track, read back.</summary>
+internal sealed record AudioTrackCheck(bool Present, string Codec, int SampleRate, int Channels, double KilobitsPerSecond, TimeSpan Duration, long Packets, string? Error)
+{
+    public static AudioTrackCheck None(string? error) => new(false, "", 0, 0, 0, TimeSpan.Zero, 0, error);
+
+    public string Describe() => Present
+        ? FormattableString.Invariant($"{Codec}, {SampleRate} Hz, {Channels} channel(s), {KilobitsPerSecond:0} kbps, {Duration.TotalSeconds:0.000} s ({Packets:N0} packets)")
+        : $"no audio track{(Error is null ? "" : $" ({Error})")}";
+}
 
 /// <summary>
 /// Reads a finished recording back with the Media Foundation source reader, without decoding: duration, size,
@@ -30,6 +41,8 @@ internal sealed record Mp4Check(
 internal static unsafe class Mp4Inspector
 {
     private const uint MF_SOURCE_READER_FIRST_VIDEO_STREAM = 0xFFFFFFFC;
+    private const uint MF_SOURCE_READER_FIRST_AUDIO_STREAM = 0xFFFFFFFD;
+    private const uint MF_SOURCE_READER_ALL_STREAMS = 0xFFFFFFFE;
     private const uint MF_SOURCE_READER_MEDIASOURCE = 0xFFFFFFFF;
     private const uint MF_SOURCE_READERF_ERROR = 0x1;
     private const uint MF_SOURCE_READERF_ENDOFSTREAM = 0x2;
@@ -47,6 +60,9 @@ internal static unsafe class Mp4Inspector
                 Check(MFCreateSourceReaderFromURL(file, null, &reader), "MFCreateSourceReaderFromURL");
             }
 
+            // Video only in this pass; otherwise the reader would queue every audio packet while we read video.
+            reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+            Check(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE), "IMFSourceReader::SetStreamSelection(video)");
             long duration = 0;
             PROPVARIANT value = default;
             if (reader->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, Ptr(in MF.MF_PD_DURATION), &value).SUCCEEDED)
@@ -140,14 +156,90 @@ internal static unsafe class Mp4Inspector
                 spacings > 0 ? spacingSum / spacings : 0,
                 fileBytes,
                 average,
-                peak);
+                peak,
+                InspectAudio(path));
+            Log.Info($"File check: audio {check.Audio.Describe()}");
             Log.Info($"File check: {check.Width}x{check.Height}, {check.FramesPerSecond:0.##} fps, {check.Codec} {check.Profile}, {check.Duration.TotalSeconds:0.0} s, {check.Frames} frames, {check.Keyframes} keyframes (every {check.AverageKeyframeSpacing:0.#} frames), {check.AverageBitsPerSecond / 1e6:0.00} Mbps average, {check.PeakBitsPerSecond / 1e6:0.00} Mbps busiest second");
             return check;
         }
         catch (Exception ex)
         {
             Log.Error($"Reading back {path} failed", ex);
-            return new Mp4Check(false, ex.Message, TimeSpan.Zero, 0, 0, 0, "", "", 0, 0, 0, fileBytes, 0, 0);
+            return new Mp4Check(false, ex.Message, TimeSpan.Zero, 0, 0, 0, "", "", 0, 0, 0, fileBytes, 0, 0, AudioTrackCheck.None(null));
+        }
+        finally
+        {
+            if (type != null)
+            {
+                type->Release();
+            }
+
+            if (reader != null)
+            {
+                reader->Release();
+            }
+        }
+    }
+
+    /// <summary>Reads the audio track on its own: codec, rate, channels, and every packet's length and time.</summary>
+    private static AudioTrackCheck InspectAudio(string path)
+    {
+        IMFSourceReader* reader = null;
+        IMFMediaType* type = null;
+        try
+        {
+            fixed (char* file = path)
+            {
+                Check(MFCreateSourceReaderFromURL(file, null, &reader), "MFCreateSourceReaderFromURL");
+            }
+
+            reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+            if (reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE).FAILED
+                || reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &type).FAILED)
+            {
+                return AudioTrackCheck.None(null);
+            }
+
+            Guid subtype;
+            string codec = type->GetGUID(Ptr(in MF.MF_MT_SUBTYPE), &subtype).SUCCEEDED && subtype == MFAudioFormat.MFAudioFormat_AAC ? "AAC" : "not AAC";
+            int rate = (int)(GetUInt32((IMFAttributes*)type, in MF.MF_MT_AUDIO_SAMPLES_PER_SECOND) ?? 0);
+            int channels = (int)(GetUInt32((IMFAttributes*)type, in MF.MF_MT_AUDIO_NUM_CHANNELS) ?? 0);
+            long packets = 0;
+            long bytes = 0;
+            long end = 0;
+            int emptyReads = 0;
+            while (emptyReads < 1000)
+            {
+                uint streamIndex;
+                uint flags;
+                long timestamp;
+                IMFSample* sample = null;
+                Check(reader->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &streamIndex, &flags, &timestamp, &sample), "IMFSourceReader::ReadSample(audio)");
+                emptyReads = sample == null ? emptyReads + 1 : 0;
+                if (sample != null)
+                {
+                    uint length;
+                    long sampleDuration;
+                    sample->GetTotalLength(&length);
+                    bytes += length;
+                    packets++;
+                    end = Math.Max(end, timestamp + (sample->GetSampleDuration(&sampleDuration).SUCCEEDED ? sampleDuration : 0));
+                    sample->Release();
+                }
+
+                if ((flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) != 0)
+                {
+                    break;
+                }
+            }
+
+            double seconds = end / 1e7;
+            return new AudioTrackCheck(true, codec, rate, channels, seconds > 0 ? bytes * 8 / seconds / 1000 : 0, TimeSpan.FromTicks(end), packets, null);
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Reading the audio track of {path} back failed", ex);
+            return AudioTrackCheck.None(ex.Message);
         }
         finally
         {

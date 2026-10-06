@@ -1,11 +1,12 @@
 using System.Globalization;
 using System.Text;
+using EKrecorder.Audio;
 using EKrecorder.Diagnostics;
 
 namespace EKrecorder.Recording;
 
 /// <summary>A finished recording: where the video went, its report, and the read-back check.</summary>
-internal sealed record FinishedRecording(bool Saved, string? VideoPath, string ReportPath, string Summary);
+internal sealed record FinishedRecording(bool Saved, string? VideoPath, string ReportPath, string Summary, Mp4Check? Check);
 
 /// <summary>
 /// After a recording stops: moves the MP4 from InProgress to the recordings folder, reads it back, and writes the
@@ -38,7 +39,7 @@ internal static class RecordingReport
         Directory.CreateDirectory(reportsFolder);
         string reportPath = FreePath(Path.Combine(reportsFolder, Path.GetFileNameWithoutExtension(session.TemporaryPath) + " report.txt"));
         string summary = Write(session, videoPath, moveProblem, check, reportPath);
-        return new FinishedRecording(session.FileFinalized && check?.Readable == true, videoPath, reportPath, summary);
+        return new FinishedRecording(session.FileFinalized && check?.Readable == true, videoPath, reportPath, summary, check);
     }
 
     private static string Write(RecordingSession session, string? videoPath, string? moveProblem, Mp4Check? check, string reportPath)
@@ -63,11 +64,17 @@ internal static class RecordingReport
             : setupFailures.Length > 0 ? "RESULT: SAVED, BUT NOT ON THE GPU PATH - a set-up was refused (see FAILURE DETAILS). Please send the whole report."
             : "RESULT: OK - the recording was saved, but not on the GPU path (see Fallbacks).";
 
+        List<string> audioProblems = AudioProblems(session, check);
+        string audioResult = session.Audio is null ? "AUDIO: none (recorded without audio)."
+            : audioProblems.Count == 0 ? "AUDIO: OK - microphone and computer audio recorded, no device was lost."
+            : $"AUDIO: {audioProblems.Count} PROBLEM(S) - see Audio health and AUDIO EVENTS.";
+
         var text = new StringBuilder();
         text.AppendLine("EKrecorder recording report");
         text.AppendLine(Invariant($"Created {DateTime.Now:yyyy-MM-dd HH:mm:ss} by EKrecorder {EnvironmentInfo.AppVersion}"));
         text.AppendLine();
         text.AppendLine(result);
+        text.AppendLine(audioResult);
         text.AppendLine($"Video file: {videoPath ?? "none"}{(moveProblem is null ? "" : $" ({moveProblem})")}");
         text.AppendLine();
 
@@ -97,6 +104,14 @@ internal static class RecordingReport
         Line(text, "Frames written", stats.FramesWritten.ToString(CultureInfo.InvariantCulture) + (check is { Readable: true } ? $" (file has {check.Frames})" : ""));
         Line(text, "Dropped frames", $"{stats.FramesDropped} ({stats.FramesDroppedLate} because EKrecorder was late, {stats.FramesDroppedEncoderBusy} because the encoder was busy)");
         Line(text, "Duplicated frames", $"{stats.FramesDuplicated} (the screen had not changed, so the last picture was repeated; normal)");
+        if (session.Audio is { } capture)
+        {
+            Line(text, "Audio track", check is { Readable: true } ? check.Audio.Describe() : "-");
+            Line(text, "Microphone", capture.Describe(capture.Microphone));
+            Line(text, "Computer audio", capture.Describe(capture.Computer));
+            Line(text, "Audio health", audioProblems.Count == 0 ? "OK" : string.Join("; ", audioProblems));
+        }
+
         Line(text, "Errors", errors.Count == 0 ? "none" : $"{errors.Count}, listed below");
         Line(text, "CPU", stats.WallClock.TotalSeconds > 0
             ? Invariant($"{stats.CpuTime.TotalSeconds / stats.WallClock.TotalSeconds * 100:0.0}% of one core on average ({Environment.ProcessorCount} logical cores; whole app)")
@@ -131,6 +146,19 @@ internal static class RecordingReport
         Line(text, "Input media type", session.EncoderInputType.Length > 0 ? session.EncoderInputType : "-");
         Line(text, "Encoder input stream", session.EncoderInputStream.Length > 0 ? session.EncoderInputStream : "-");
         Line(text, "Sink writer", session.WriterStatistics);
+        if (session.Audio is { } audio)
+        {
+            foreach (string stream in audio.StreamDetails())
+            {
+                Line(text, "Audio stream", stream);
+            }
+
+            Line(text, "Audio mix", session.Mixer is { } mixer
+                ? Invariant($"48 kHz float, mixed {AudioMixer.DelaySeconds:0.0} s behind real time; {mixer.WrittenFrames / (double)TimelineClock.SampleRate:0.000} s written; limiter (-1 dBFS) acted on {mixer.Limiter.LimitedSamples:N0} samples, deepest {mixer.Limiter.MaxReductionDb:0.0} dB; largest backlog {mixer.MaxBacklogSeconds:0.00} s; encoder: {session.AudioStatistics}{(mixer.Error is null ? "" : $"; ENDED EARLY: {mixer.Error}")}")
+                : $"no audio track ({session.AudioError ?? "not started"})");
+            Line(text, "Audio offset", Invariant($"audio placed {session.AudioOffset.TotalMilliseconds:0} ms after its capture time (half a video frame: the average age of the picture in a frame)"));
+        }
+
         Line(text, "Pacing", stats.Ticks > 0
             ? Invariant($"{session.PacingTimer}; wake-up lateness {stats.LatenessSumMs / stats.Ticks:0.0} ms average, {stats.LatenessMaxMs:0.0} ms max; work per frame {stats.WorkSumMs / stats.Ticks:0.0} ms average, {stats.WorkMaxMs:0.0} ms max; slowest WriteSample {stats.WriteMaxMs:0.0} ms")
             : "-");
@@ -145,6 +173,16 @@ internal static class RecordingReport
         }
 
         Line(text, "Log", Log.FilePath ?? "-");
+        if (session.Audio is { } events)
+        {
+            text.AppendLine();
+            text.AppendLine("AUDIO EVENTS (recording time; before the recording starts, clock time)");
+            foreach (string line in events.Events)
+            {
+                text.AppendLine($"  {line}");
+            }
+        }
+
         if (setupFailures.Length > 0 || session.RecordingFailure.Length > 0)
         {
             text.AppendLine();
@@ -156,6 +194,58 @@ internal static class RecordingReport
         File.WriteAllText(reportPath, text.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
         Log.Info($"Recording report written: {reportPath}");
         return summaryLine;
+    }
+
+    /// <summary>What went wrong with the audio, in a few words each (empty when nothing did).</summary>
+    private static List<string> AudioProblems(RecordingSession session, Mp4Check? check)
+    {
+        var problems = new List<string>();
+        if (session.Audio is not { } audio)
+        {
+            return problems;
+        }
+
+        if (session.AudioError is { } error)
+        {
+            problems.Add($"NO AUDIO TRACK: {error}");
+        }
+        else if (check is { Readable: true })
+        {
+            if (!check.Audio.Present)
+            {
+                problems.Add("the file has no audio track");
+            }
+            else if (Math.Abs(check.Audio.Duration.TotalSeconds - check.Duration.TotalSeconds) > 0.1)
+            {
+                problems.Add(Invariant($"audio track is {check.Audio.Duration.TotalSeconds:0.00} s, video {check.Duration.TotalSeconds:0.00} s"));
+            }
+        }
+
+        foreach (AudioCapture.Input input in new[] { audio.Microphone, audio.Computer })
+        {
+            if (input.MissingSeconds >= 0.05)
+            {
+                problems.Add(Invariant($"{input.Name.ToLowerInvariant()} had no device for {input.MissingSeconds:0.0} s (silence recorded there)"));
+            }
+        }
+
+        if (audio.Microphone.DigitalSilenceEpisodes > 0)
+        {
+            problems.Add($"microphone sent only digital silence ({audio.Microphone.DigitalSilenceEpisodes} warning(s): muted or blocked?)");
+        }
+
+        long late = audio.Rings.Sum(r => r.LateSamples);
+        if (late > 0)
+        {
+            problems.Add(Invariant($"{late * 1000.0 / TimelineClock.SampleRate:0} ms of audio arrived too late for the mix and was dropped"));
+        }
+
+        if (session.Mixer?.Error is { } mixerError)
+        {
+            problems.Add($"the audio track ended early: {mixerError}");
+        }
+
+        return problems;
     }
 
     private static void Line(StringBuilder text, string label, string value) => text.AppendLine($"  {label + ":",-22} {value}");

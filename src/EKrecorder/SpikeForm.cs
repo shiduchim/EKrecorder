@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using EKrecorder.Audio;
 using EKrecorder.Capture;
 using EKrecorder.Diagnostics;
 using EKrecorder.Monitors;
@@ -12,7 +13,9 @@ namespace EKrecorder;
 
 /// <summary>
 /// The small test window: pick a monitor, Identify, Start/Stop recording, open the recordings and the last report,
-/// and the Step 1 capture test. In self-test mode (the build machine) it runs the capture test, a 6-second recording
+/// and the Step 1 capture test. Audio: pick the microphone and computer-audio device (Windows defaults, or a specific
+/// one), see each input's state and level while recording, or with "Show audio meters" (only then, or while
+/// recording, are the devices open). In self-test mode (the build machine) it runs the capture test, a 6-second recording
 /// and a 3-second recording whose first set-up is made to fail (to prove the fallback), asks nothing, and closes.
 /// </summary>
 internal sealed class SpikeForm : Form
@@ -28,6 +31,14 @@ internal sealed class SpikeForm : Form
     private readonly Button _reportButton;
     private readonly Button _testButton;
     private readonly Label _status;
+    private readonly ComboBox _micChoice;
+    private readonly ComboBox _outputChoice;
+    private readonly CheckBox _metersCheck;
+    private readonly LevelMeter _micMeter;
+    private readonly LevelMeter _outputMeter;
+    private readonly Label _micState;
+    private readonly Label _outputState;
+    private readonly System.Windows.Forms.Timer _audioTimer = new() { Interval = 100 };
     private readonly System.Windows.Forms.Timer _identifyTimer = new() { Interval = 3000 };
     private readonly System.Windows.Forms.Timer _recordingTimer = new() { Interval = 500 };
     private IReadOnlyList<MonitorInfo> _monitors = [];
@@ -39,6 +50,8 @@ internal sealed class SpikeForm : Form
     private bool _busy;
     private bool _stopping;
     private bool _closeAfterStop;
+    private AudioCapture? _meterAudio;
+    private bool _fillingDevices;
 
     public SpikeForm(bool selfTest, string outputRoot, RecordingFolders folders)
     {
@@ -79,6 +92,34 @@ internal sealed class SpikeForm : Form
         _testButton = new Button { Text = "Capture test", AutoSize = true };
         layout.Controls.Add(ButtonRow(new Padding(0), _recordingsButton, _reportButton, _testButton));
 
+        var audio = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3, Margin = new Padding(0, 8, 0, 0) };
+        _micChoice = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 330, Margin = new Padding(3, 2, 3, 2) };
+        _outputChoice = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 330, Margin = new Padding(3, 2, 3, 2) };
+        _metersCheck = new CheckBox { Text = "Show audio meters (opens the devices)", AutoSize = true, Margin = new Padding(3, 4, 3, 2) };
+        _micMeter = new LevelMeter();
+        _outputMeter = new LevelMeter();
+        _micState = new Label { AutoSize = true, MaximumSize = new Size(300, 0), Margin = new Padding(3, 2, 3, 2) };
+        _outputState = new Label { AutoSize = true, MaximumSize = new Size(300, 0), Margin = new Padding(3, 2, 3, 2) };
+        audio.Controls.Add(RowLabel("Microphone:"), 0, 0);
+        audio.Controls.Add(_micChoice, 1, 0);
+        audio.SetColumnSpan(_micChoice, 2);
+        audio.Controls.Add(RowLabel("Computer audio:"), 0, 1);
+        audio.Controls.Add(_outputChoice, 1, 1);
+        audio.SetColumnSpan(_outputChoice, 2);
+        audio.Controls.Add(_metersCheck, 0, 2);
+        audio.SetColumnSpan(_metersCheck, 3);
+        audio.Controls.Add(RowLabel("Mic"), 0, 3);
+        audio.Controls.Add(_micMeter, 1, 3);
+        audio.Controls.Add(_micState, 2, 3);
+        audio.Controls.Add(RowLabel("Computer"), 0, 4);
+        audio.Controls.Add(_outputMeter, 1, 4);
+        audio.Controls.Add(_outputState, 2, 4);
+        layout.Controls.Add(audio);
+        _micChoice.Items.Add(new DeviceChoice(null, "Windows default communications microphone"));
+        _outputChoice.Items.Add(new DeviceChoice(null, "Windows default outputs (playback + communications)"));
+        _micChoice.SelectedIndex = 0;
+        _outputChoice.SelectedIndex = 0;
+
         _status = new Label
         {
             AutoSize = true,
@@ -97,6 +138,14 @@ internal sealed class SpikeForm : Form
         _testButton.Click += async (_, _) => await RunTestAsync();
         _identifyTimer.Tick += (_, _) => HideIdentify();
         _recordingTimer.Tick += (_, _) => ShowRecordingStatus();
+        _micChoice.DropDown += async (_, _) => await RefreshAudioDevicesAsync();
+        _outputChoice.DropDown += async (_, _) => await RefreshAudioDevicesAsync();
+        _micChoice.SelectedIndexChanged += (_, _) => OnAudioSelectionChanged();
+        _outputChoice.SelectedIndexChanged += (_, _) => OnAudioSelectionChanged();
+        _metersCheck.CheckedChanged += (_, _) => UpdateMeterSession();
+        Resize += (_, _) => UpdateMeterSession();
+        _audioTimer.Tick += (_, _) => ShowAudioStatus();
+        _audioTimer.Start();
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
         RefreshMonitors("start");
@@ -108,6 +157,7 @@ internal sealed class SpikeForm : Form
     protected override async void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        await RefreshAudioDevicesAsync();
         if (_selfTest)
         {
             await RunTestAsync();
@@ -118,6 +168,7 @@ internal sealed class SpikeForm : Form
 
     protected override async void OnFormClosing(FormClosingEventArgs e)
     {
+        StopMeterSession();
         if (_recording is not null && !_closeAfterStop)
         {
             // Never lose a recording by closing the window: finish the file first, then close.
@@ -140,10 +191,14 @@ internal sealed class SpikeForm : Form
             _indicator?.Dispose();
             _identifyTimer.Dispose();
             _recordingTimer.Dispose();
+            _audioTimer.Dispose();
+            StopMeterSession();
         }
 
         base.Dispose(disposing);
     }
+
+    private static Label RowLabel(string text) => new() { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 4, 3, 2) };
 
     private static FlowLayoutPanel ButtonRow(Padding margin, params Control[] buttons)
     {
@@ -253,13 +308,16 @@ internal sealed class SpikeForm : Form
 
         _busy = true;
         UpdateButtons();
+        // The recording opens the devices itself; the meters' own capture closes first.
+        StopMeterSession();
         SetStatus($"Starting to record {monitor.Name}…");
         try
         {
             CaptureAccessResult borderless = await CaptureSessionSetup.RequestAccessAsync(GraphicsCaptureAccessKind.Borderless);
             Directory.CreateDirectory(_folders.InProgress);
             string temporaryPath = Path.Combine(_folders.InProgress, $"EKrecording {DateTime.Now:yyyy-MM-dd HH-mm-ss}.mp4");
-            RecordingSession session = await RecordingSession.StartAsync(monitor, RecordingPreset.Default, temporaryPath, borderless.Text, simulateFirstSetupFailure);
+            AudioSelection audio = SelectedAudio();
+            RecordingSession session = await RecordingSession.StartAsync(monitor, RecordingPreset.Default, temporaryPath, borderless.Text, audio, simulateFirstSetupFailure);
             _recording = session;
 
             _indicator = new RecordingIndicator();
@@ -340,6 +398,7 @@ internal sealed class SpikeForm : Form
             _recording = null;
             _stopping = false;
             UpdateButtons();
+            UpdateMeterSession();
         }
     }
 
@@ -386,8 +445,12 @@ internal sealed class SpikeForm : Form
         await Task.Delay(length);
         FinishedRecording? finished = await StopRecordingAsync("self-test finished");
         bool fallbackShown = !simulateFirstSetupFailure || session.SetupFailures.Contains("simulated by the self-test", StringComparison.Ordinal);
-        bool passed = finished is { Saved: true } && fallbackShown;
-        Log.Info($"{name}: {(passed ? "PASS" : "FAIL")} (saved: {finished?.Saved == true}; set-up failure reported: {fallbackShown}; {session.FramePath})");
+        // The build machine has no sound devices: the audio track must still be there, silent, as long as the video.
+        AudioTrackCheck? audioTrack = finished?.Check?.Audio;
+        bool audioOk = audioTrack is { Present: true }
+            && Math.Abs(audioTrack.Duration.TotalSeconds - finished!.Check!.Duration.TotalSeconds) < 0.1;
+        bool passed = finished is { Saved: true } && fallbackShown && audioOk;
+        Log.Info($"{name}: {(passed ? "PASS" : "FAIL")} (saved: {finished?.Saved == true}; set-up failure reported: {fallbackShown}; audio track: {audioTrack?.Describe() ?? "none"}; video {finished?.Check?.Duration.TotalSeconds:0.000} s; {session.FramePath})");
         return passed;
     }
 
@@ -467,6 +530,9 @@ internal sealed class SpikeForm : Form
     {
         bool recording = _recording is not null;
         bool idle = !_busy && !recording;
+        _micChoice.Enabled = idle;
+        _outputChoice.Enabled = idle;
+        _metersCheck.Enabled = idle;
         _monitorPanel.Enabled = idle;
         _identifyButton.Enabled = !_busy && _monitors.Count > 0;
         _startButton.Enabled = idle && _monitors.Count > 0;
@@ -476,6 +542,138 @@ internal sealed class SpikeForm : Form
     }
 
     private void SetStatus(string text) => _status.Text = text;
+
+    private AudioSelection SelectedAudio()
+    {
+        var mic = _micChoice.SelectedItem as DeviceChoice;
+        var output = _outputChoice.SelectedItem as DeviceChoice;
+        return new AudioSelection(mic?.Id, mic?.Name, output?.Id, output?.Name);
+    }
+
+    /// <summary>Fills the device lists (on a background thread; listing does not open any device).</summary>
+    private async Task RefreshAudioDevicesAsync()
+    {
+        if (_fillingDevices)
+        {
+            return;
+        }
+
+        _fillingDevices = true;
+        try
+        {
+            (List<AudioDevice> mics, List<AudioDevice> outputs) = await Task.Run(() => (CoreAudio.ListMicrophones(), CoreAudio.ListOutputs()));
+            Fill(_micChoice, mics);
+            Fill(_outputChoice, outputs);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Listing audio devices failed", ex);
+        }
+        finally
+        {
+            _fillingDevices = false;
+        }
+    }
+
+    /// <summary>Default first, then the devices; a selected device that is not connected now stays listed.</summary>
+    private void Fill(ComboBox box, List<AudioDevice> devices)
+    {
+        var selected = box.SelectedItem as DeviceChoice;
+        var items = new List<DeviceChoice> { (DeviceChoice)box.Items[0]! };
+        items.AddRange(devices.Select(d => new DeviceChoice(d.Id, d.Name)));
+        if (selected?.Id is { } id && devices.All(d => d.Id != id))
+        {
+            items.Add(new DeviceChoice(id, selected.Name, Connected: false));
+        }
+
+        _fillingDevices = true;
+        box.BeginUpdate();
+        box.Items.Clear();
+        box.Items.AddRange(items.ToArray<object>());
+        box.SelectedItem = items.FirstOrDefault(i => i.Id == selected?.Id) ?? items[0];
+        box.EndUpdate();
+    }
+
+    private void OnAudioSelectionChanged()
+    {
+        if (_fillingDevices || _meterAudio is null)
+        {
+            return;
+        }
+
+        // The meters follow the new choice.
+        StopMeterSession();
+        UpdateMeterSession();
+    }
+
+    /// <summary>
+    /// The meters' own capture runs only while "Show audio meters" is ticked, the window is not minimized and no
+    /// recording runs (a recording shows its own levels). Otherwise no audio device is open.
+    /// </summary>
+    private void UpdateMeterSession()
+    {
+        bool wanted = _metersCheck.Checked && _recording is null && !_busy && WindowState != FormWindowState.Minimized && !IsDisposed;
+        if (wanted && _meterAudio is null)
+        {
+            _meterAudio = new AudioCapture(SelectedAudio(), forRecording: false);
+            _meterAudio.Start();
+        }
+        else if (!wanted)
+        {
+            StopMeterSession();
+        }
+    }
+
+    private void StopMeterSession()
+    {
+        AudioCapture? meters = _meterAudio;
+        _meterAudio = null;
+        if (meters is not null)
+        {
+            // Closing waits for the capture threads; not on the window's thread.
+            _ = Task.Run(meters.Dispose);
+        }
+    }
+
+    private void ShowAudioStatus()
+    {
+        AudioCapture? audio = _recording?.Audio ?? _meterAudio;
+        if (audio is null)
+        {
+            _micMeter.Clear();
+            _outputMeter.Clear();
+            string closed = _metersCheck.Checked && WindowState == FormWindowState.Minimized ? "closed while minimized" : "closed (opened while recording, or with the meters)";
+            _micState.Text = closed;
+            _outputState.Text = closed;
+            return;
+        }
+
+        (AudioInputStatus mic, AudioInputStatus computer) = audio.Snapshot();
+        _micMeter.Push(mic.Level);
+        _outputMeter.Push(computer.Level);
+        _micState.Text = Describe(mic);
+        _outputState.Text = Describe(computer);
+    }
+
+    private static string Describe(AudioInputStatus status)
+    {
+        string state = status.State switch
+        {
+            InputState.Running => "Running",
+            InputState.Fallback => "Fallback",
+            InputState.Lost => "Lost (silence recorded)",
+            InputState.Retrying => "Retrying",
+            InputState.NoDevice => "No device",
+            _ => "Opening",
+        };
+        return status.Warning is null ? $"{state} · {status.Devices}" : $"{state} · {status.Devices}{Environment.NewLine}WARNING: {status.Warning}";
+    }
+
+    /// <summary>An entry in a device list: Windows' default (no id) or a specific device.</summary>
+    private sealed record DeviceChoice(string? Id, string Name, bool Connected = true)
+    {
+        public override string ToString() => Connected ? Name : $"{Name} (not connected)";
+    }
 
     private void OpenRecordingsFolder()
     {
