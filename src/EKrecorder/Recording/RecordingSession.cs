@@ -447,6 +447,7 @@ internal sealed unsafe class RecordingSession
     {
         try
         {
+            Audio?.EndTimeline();
             if (Mixer is not null)
             {
                 long endFrame = Slots * TimelineClock.SampleRate / Preset.FramesPerSecond;

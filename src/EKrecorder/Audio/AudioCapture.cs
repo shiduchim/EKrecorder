@@ -77,6 +77,7 @@ internal sealed unsafe class AudioCapture : IDisposable
     private long _nextPeriodicCheck;
     private bool _reconcileNeeded = true;
     private bool _stopped;
+    private long _timelineEnd;
 
     /// <param name="forRecording">True: audio goes onto the recording timeline. False: levels only (meters).</param>
     public AudioCapture(AudioSelection selection, bool forRecording)
@@ -101,6 +102,16 @@ internal sealed unsafe class AudioCapture : IDisposable
     {
         _anchor.Start(clock);
         Event("Recording timeline started.");
+    }
+
+    /// <summary>
+    /// The video has stopped: time without a device is no longer counted (the devices stay open a little longer,
+    /// while the mixer collects the last audio).
+    /// </summary>
+    public void EndTimeline()
+    {
+        Interlocked.CompareExchange(ref _timelineEnd, TimelineClock.NowHns(), 0);
+        Event("Video stopped; collecting the last audio.");
     }
 
     /// <summary>Closes every device and waits for the threads (at most a few seconds).</summary>
@@ -515,6 +526,9 @@ internal sealed unsafe class AudioCapture : IDisposable
             Event("Microphone: sound is coming in again.");
         }
 
+        // Time without a running device counts only while the recording's timeline runs.
+        long end = Interlocked.Read(ref _timelineEnd);
+        long counted = end != 0 ? Math.Min(now, end) : now;
         foreach (Input input in new[] { _microphone, _computer })
         {
             bool running = input.Endpoints.Any(e => e.Worker?.State == WorkerState.Running);
@@ -523,13 +537,14 @@ internal sealed unsafe class AudioCapture : IDisposable
                 continue;
             }
 
-            if (!running && input.MissingSince == 0)
+            if (!running && input.MissingSince == 0 && (end == 0 || now < end))
             {
-                input.MissingSince = now;
+                input.MissingSince = counted;
             }
-            else if (running && input.MissingSince != 0)
+            else if (input.MissingSince != 0 && (running || end != 0))
             {
-                input.MissingSeconds += (now - input.MissingSince) / 1e7;
+                // Back, or the video ended: close the stretch.
+                input.MissingSeconds += (counted - input.MissingSince) / 1e7;
                 input.MissingSince = 0;
             }
         }
@@ -537,12 +552,22 @@ internal sealed unsafe class AudioCapture : IDisposable
 
     private void Publish(long now)
     {
+        var transitions = new List<string>();
         lock (_gate)
         {
             foreach (Input input in new[] { _microphone, _computer })
             {
-                input.Publish(now);
+                if (input.Publish(now) is { } transition)
+                {
+                    transitions.Add(transition);
+                }
             }
+        }
+
+        // Every state change goes into the event log: Resolving -> Running -> Lost -> Retrying -> Running.
+        foreach (string transition in transitions)
+        {
+            Event(transition);
         }
     }
 
@@ -608,7 +633,9 @@ internal sealed unsafe class AudioCapture : IDisposable
 
             if (input.MissingSince != 0)
             {
-                input.MissingSeconds += (TimelineClock.NowHns() - input.MissingSince) / 1e7;
+                long end = Interlocked.Read(ref _timelineEnd);
+                long now = TimelineClock.NowHns();
+                input.MissingSeconds += ((end != 0 ? Math.Min(now, end) : now) - input.MissingSince) / 1e7;
                 input.MissingSince = 0;
             }
         }
@@ -697,6 +724,7 @@ internal sealed unsafe class AudioCapture : IDisposable
     {
         private readonly List<string> _devicesUsed = new();
         private float _level;
+        private bool _published;
 
         public Input(string name, bool loopback, string? pinnedId, string mode)
         {
@@ -737,9 +765,13 @@ internal sealed unsafe class AudioCapture : IDisposable
 
         internal Endpoint? Find(string id) => Endpoints.FirstOrDefault(e => e.Id == id);
 
-        /// <summary>Works out the state and device text (called with the capture's lock held).</summary>
-        public void Publish(long now)
+        /// <summary>
+        /// Works out the state and device text (called with the capture's lock held). Returns a line for the event
+        /// log when the state changed.
+        /// </summary>
+        public string? Publish(long now)
         {
+            InputState previous = State;
             List<Endpoint> desired = Endpoints.Where(e => e.Desired).ToList();
             bool anyRunning = Endpoints.Any(e => e.Worker?.State == WorkerState.Running);
             State = desired.Count == 0 && !anyRunning ? InputState.NoDevice
@@ -770,6 +802,20 @@ internal sealed unsafe class AudioCapture : IDisposable
             }
 
             Devices = parts.Count > 0 ? string.Join(" + ", parts) : NoDeviceReason ?? "none";
+            if (State == previous && _published)
+            {
+                return null;
+            }
+
+            _published = true;
+            string detail = State switch
+            {
+                InputState.NoDevice => $" ({NoDeviceReason ?? "no device"}; silence is recorded)",
+                InputState.Lost => " (silence is recorded until it is back)",
+                InputState.Running or InputState.Fallback or InputState.Retrying => $" ({Devices})",
+                _ => "",
+            };
+            return $"{Name}: {previous} -> {State}{detail}";
         }
 
         /// <summary>For the window (lock held): the level since the last snapshot is handed over and reset.</summary>
