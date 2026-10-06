@@ -215,9 +215,9 @@ internal static class RecordingReport
             {
                 problems.Add("the file has no audio track");
             }
-            else if (Math.Abs(check.Audio.Duration.TotalSeconds - check.Duration.TotalSeconds) > 0.1)
+            else if (Math.Abs(check.Audio.Duration.TotalSeconds - check.VideoDuration.TotalSeconds) > 0.1)
             {
-                problems.Add(Invariant($"audio track is {check.Audio.Duration.TotalSeconds:0.00} s, video {check.Duration.TotalSeconds:0.00} s"));
+                problems.Add(Invariant($"audio track is {check.Audio.Duration.TotalSeconds:0.00} s, video {check.VideoDuration.TotalSeconds:0.00} s"));
             }
         }
 

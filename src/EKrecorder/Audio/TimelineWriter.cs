@@ -16,6 +16,13 @@ internal sealed class TimelineWriter
     /// <summary>A packet this far from its expected place starts a new run (20 ms).</summary>
     public const double ResyncThreshold = 0.020 * TimelineClock.SampleRate;
 
+    /// <summary>
+    /// When Windows flags a packet as not following on from the previous one, a new run starts if the packet is more
+    /// than 1 ms from its expected place: the gap is placed exactly instead of being steered out over seconds. A flag
+    /// on a packet that does follow on (some drivers set it too often) changes nothing.
+    /// </summary>
+    public const double DiscontinuityThreshold = 0.001 * TimelineClock.SampleRate;
+
     /// <summary>The steering never changes the speed by more than 0.5 % (8.6 cents): far too little to hear.</summary>
     public const double MaxCorrection = 0.005;
 
@@ -74,7 +81,8 @@ internal sealed class TimelineWriter
     /// <param name="frames">Interleaved samples, one or two per frame.</param>
     /// <param name="frameCount">Frames in the packet.</param>
     /// <param name="position">Timeline position of the packet's first frame, from its QPC time.</param>
-    public void Write(ReadOnlySpan<float> frames, int frameCount, double position)
+    /// <param name="discontinuity">Windows flagged the packet as not following on from the previous one.</param>
+    public void Write(ReadOnlySpan<float> frames, int frameCount, double position, bool discontinuity = false)
     {
         if (!_running)
         {
@@ -86,7 +94,7 @@ internal sealed class TimelineWriter
             // Where this packet's first frame lands if the stream just continues.
             double mapped = _outPosition + ((3 - _phase) / _step);
             double error = position - mapped;
-            if (Math.Abs(error) > ResyncThreshold)
+            if (Math.Abs(error) > (discontinuity ? DiscontinuityThreshold : ResyncThreshold))
             {
                 StartRun(position);
                 Resyncs++;

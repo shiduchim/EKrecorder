@@ -263,6 +263,62 @@ public sealed class TimelineWriterTests
     }
 
     [Fact]
+    public void FlaggedSmallGapIsPlacedExactly()
+    {
+        // 8 ms of samples lost and Windows says so (DATA_DISCONTINUITY): the gap is placed at once, not steered.
+        var ring = new TimelineRing();
+        var writer = new TimelineWriter(ring, Rate, 1);
+        var device = new SimulatedDevice(driftPpm: 80, jitterMs: 0.2, channels: 1, seed: 19);
+        var check = new TimelineCheck(1, 1, ring);
+        device.StartAt(0.3);
+        while (device.Now < 30)
+        {
+            check.ReadUntil(device.CapturePacket(writer), _ => Expect.Anything);
+        }
+
+        double gapStart = device.Now;
+        device.StartAt(gapStart + 0.008);
+        long gapFrom = (long)(gapStart * Rate);
+        long gapTo = (long)((gapStart + 0.008) * Rate);
+        Expect Expectation(long p) =>
+            p < gapFrom + 30 ? Expect.Anything
+            : p < gapTo - 30 ? Expect.Silence
+            : p < gapTo + 30 ? Expect.Anything
+            : Expect.Signal;
+        check.ReadUntil(device.CapturePacket(writer, discontinuity: true), Expectation);
+        while (device.Now < 60)
+        {
+            check.ReadUntil(device.CapturePacket(writer), Expectation);
+        }
+
+        Report(check, writer, "8 ms gap flagged by Windows");
+        Assert.Equal(1, writer.Resyncs);
+        Assert.Equal(0, check.NoiseInSilence);
+        Assert.True(check.MaxErrorMs < 1.0, $"max error right after the gap {check.MaxErrorMs:0.000} ms");
+        Assert.Equal(0, check.Holes);
+    }
+
+    [Fact]
+    public void SpuriousDiscontinuityFlagsChangeNothing()
+    {
+        // A driver that flags every packet although nothing is missing: no resyncs, no clicks.
+        var ring = new TimelineRing();
+        var writer = new TimelineWriter(ring, Rate, 2);
+        var device = new SimulatedDevice(driftPpm: -120, jitterMs: 0.3, channels: 2, seed: 23);
+        var check = new TimelineCheck(2, 1, ring);
+        device.StartAt(0.2);
+        while (device.Now < 120)
+        {
+            check.ReadUntil(device.CapturePacket(writer, discontinuity: true), p => p < 60 * Rate ? Expect.Anything : Expect.Signal);
+        }
+
+        Report(check, writer, "every packet flagged, nothing missing");
+        Assert.Equal(0, writer.Resyncs);
+        Assert.True(check.MaxErrorMs < 1.0, $"max error {check.MaxErrorMs:0.000} ms");
+        Assert.Equal(0, check.Holes);
+    }
+
+    [Fact]
     public void CorrectionNeverExceedsTheLimit()
     {
         // A wildly wrong clock (1.5 %) cannot be followed by steering; the stream is moved by resyncs instead,

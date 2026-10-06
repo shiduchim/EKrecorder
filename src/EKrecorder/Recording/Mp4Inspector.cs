@@ -21,7 +21,8 @@ internal sealed record Mp4Check(
     long FileBytes,
     double AverageBitsPerSecond,
     double PeakBitsPerSecond,
-    AudioTrackCheck Audio);
+    AudioTrackCheck Audio,
+    TimeSpan VideoDuration);
 
 /// <summary>The file's audio track, read back.</summary>
 internal sealed record AudioTrackCheck(bool Present, string Codec, int SampleRate, int Channels, double KilobitsPerSecond, TimeSpan Duration, long Packets, string? Error)
@@ -91,6 +92,7 @@ internal static unsafe class Mp4Inspector
             long frames = 0;
             long keyframes = 0;
             long bytes = 0;
+            long videoEnd = 0;
             long lastKeyframe = -1;
             double spacingSum = 0;
             int spacings = 0;
@@ -109,6 +111,8 @@ internal static unsafe class Mp4Inspector
                     uint length;
                     sample->GetTotalLength(&length);
                     bytes += length;
+                    long frameDuration;
+                    videoEnd = Math.Max(videoEnd, timestamp + (sample->GetSampleDuration(&frameDuration).SUCCEEDED ? frameDuration : 0));
                     long second = timestamp / 10_000_000;
                     bytesPerSecond[second] = bytesPerSecond.GetValueOrDefault(second) + length;
                     uint cleanPoint;
@@ -157,7 +161,8 @@ internal static unsafe class Mp4Inspector
                 fileBytes,
                 average,
                 peak,
-                InspectAudio(path));
+                InspectAudio(path),
+                TimeSpan.FromTicks(videoEnd));
             Log.Info($"File check: audio {check.Audio.Describe()}");
             Log.Info($"File check: {check.Width}x{check.Height}, {check.FramesPerSecond:0.##} fps, {check.Codec} {check.Profile}, {check.Duration.TotalSeconds:0.0} s, {check.Frames} frames, {check.Keyframes} keyframes (every {check.AverageKeyframeSpacing:0.#} frames), {check.AverageBitsPerSecond / 1e6:0.00} Mbps average, {check.PeakBitsPerSecond / 1e6:0.00} Mbps busiest second");
             return check;
@@ -165,7 +170,7 @@ internal static unsafe class Mp4Inspector
         catch (Exception ex)
         {
             Log.Error($"Reading back {path} failed", ex);
-            return new Mp4Check(false, ex.Message, TimeSpan.Zero, 0, 0, 0, "", "", 0, 0, 0, fileBytes, 0, 0, AudioTrackCheck.None(null));
+            return new Mp4Check(false, ex.Message, TimeSpan.Zero, 0, 0, 0, "", "", 0, 0, 0, fileBytes, 0, 0, AudioTrackCheck.None(null), TimeSpan.Zero);
         }
         finally
         {

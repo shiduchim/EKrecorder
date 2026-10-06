@@ -126,7 +126,14 @@ internal sealed unsafe class CaptureWorker
 
     public long EndedHns { get; private set; }
 
-    public void Start() => _thread.Start();
+    /// <summary>When the thread was started (QPC, 100-ns units); a stream still opening long after this is stuck.</summary>
+    public long StartedHns { get; private set; }
+
+    public void Start()
+    {
+        StartedHns = TimelineClock.NowHns();
+        _thread.Start();
+    }
 
     /// <summary>Asks the thread to close the stream; it notices within about 100 ms.</summary>
     public void RequestStop() => _stopRequested = true;
@@ -366,7 +373,8 @@ internal sealed unsafe class CaptureWorker
                 _writer.Restart();
             }
 
-            _writer.Write(samples, frames, clock.PositionOf(start));
+            bool gap = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0 && Packets > 1;
+            _writer.Write(samples, frames, clock.PositionOf(start), gap);
         }
 
         return clock;

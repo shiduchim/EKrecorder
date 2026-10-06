@@ -28,6 +28,7 @@ internal enum InputState
     Lost,
     Retrying,
     NoDevice,
+    Closed,
 }
 
 /// <summary>A snapshot of one input for the window.</summary>
@@ -56,6 +57,7 @@ internal sealed unsafe class AudioCapture : IDisposable
     private const long SettleMax = 20_000_000;       // ... but at most 2 s after the first one
     private const long PeriodicCheck = 50_000_000;   // look again every 5 s anyway, in case a notification was missed
     private const long Suppression = 100_000_000;    // a microphone that failed 3 times in a row is passed over for 10 s
+    private const long OpenTimeout = 50_000_000;     // a device still opening after 5 s has a driver that is not responding
     private const int RingCount = 8;
 
     private readonly AudioSelection _selection;
@@ -70,6 +72,7 @@ internal sealed unsafe class AudioCapture : IDisposable
     private readonly List<CaptureWorker> _finished = new();
     private readonly Dictionary<string, long> _suppressedUntil = new();
     private readonly Dictionary<string, string> _names = new();
+    private readonly Dictionary<string, (int Count, string Reason)> _failedOpens = new();
     private readonly Thread _thread;
     private volatile bool _stopRequested;
     private long _settleUntil;
@@ -171,12 +174,14 @@ internal sealed unsafe class AudioCapture : IDisposable
 
     public Input Computer => _computer;
 
-    /// <summary>Every capture stream that ran, for the report's details.</summary>
+    /// <summary>Every capture stream that ran, and the devices that could not be opened, for the report's details.</summary>
     public IReadOnlyList<string> StreamDetails()
     {
         lock (_gate)
         {
-            return _finished.Select(DescribeWorker).ToArray();
+            return _finished.Where(w => w.Packets > 0).Select(DescribeWorker)
+                .Concat(_failedOpens.Select(f => $"\"{f.Key}\": could not be opened {f.Value.Count} time(s); last reason: {f.Value.Reason}"))
+                .ToArray();
         }
     }
 
@@ -381,9 +386,13 @@ internal sealed unsafe class AudioCapture : IDisposable
     {
         if (input.Fallback != fallback)
         {
-            Event(fallback
-                ? $"{input.Name}: the selected device is missing; using the Windows default until it is back."
-                : $"{input.Name}: back on the selected device.");
+            Event((fallback, input.PinnedId is not null) switch
+            {
+                (true, true) => $"{input.Name}: the selected device is missing; using the Windows default until it is back.",
+                (true, false) => $"{input.Name}: the Windows default communications microphone keeps failing; using the default microphone for now.",
+                (false, true) => $"{input.Name}: back on the selected device.",
+                _ => $"{input.Name}: back on the Windows default communications microphone.",
+            });
         }
 
         input.Fallback = fallback;
@@ -412,24 +421,29 @@ internal sealed unsafe class AudioCapture : IDisposable
             }
         }
 
-        foreach (Endpoint endpoint in input.Endpoints.Where(e => e.Desired && e.Worker is null && now >= e.RetryAt))
+        foreach (Endpoint endpoint in input.Endpoints.Where(e => e.Desired && e.Worker is null && now >= e.RetryAt).ToList())
         {
-            StartWorker(input, endpoint);
+            StartWorker(input, endpoint, now);
         }
 
         RetireOldEndpoints(input);
     }
 
     /// <summary>
-    /// Make before break: a device that is no longer wanted keeps capturing until its replacement runs, so
-    /// switching to a new default leaves no hole, and a new default that will not open does not cost the working one.
+    /// Make before break: a device that is no longer wanted keeps capturing while its replacement opens, so switching
+    /// to a new default leaves no hole. A microphone is kept until a replacement runs (a new default that will not
+    /// open does not cost the working one). Computer audio is not held for a replacement that has already failed:
+    /// an output Windows no longer uses must not stay in the mix.
     /// </summary>
     private void RetireOldEndpoints(Input input)
     {
-        bool replacementsRunning = input.Endpoints.Where(e => e.Desired).All(e => e.Worker?.State == WorkerState.Running);
+        List<Endpoint> desired = input.Endpoints.Where(e => e.Desired).ToList();
+        bool firstAttemptPending = desired.Any(e => e.FailedAttempts == 0 && e.Worker?.State is null or WorkerState.Opening);
+        bool anyDesiredRunning = desired.Any(e => e.Worker?.State == WorkerState.Running);
+        bool keepOld = firstAttemptPending || (!input.Loopback && !anyDesiredRunning);
         foreach (Endpoint endpoint in input.Endpoints.Where(e => !e.Desired).ToList())
         {
-            if (endpoint.Worker is null || endpoint.Worker.State != WorkerState.Running || replacementsRunning)
+            if (endpoint.Worker is null || endpoint.Worker.State != WorkerState.Running || !keepOld)
             {
                 if (endpoint.Worker is not null)
                 {
@@ -443,7 +457,7 @@ internal sealed unsafe class AudioCapture : IDisposable
         }
     }
 
-    private void StartWorker(Input input, Endpoint endpoint)
+    private void StartWorker(Input input, Endpoint endpoint, long now)
     {
         TimelineRing? ring = null;
         if (_rings.Length > 0)
@@ -451,19 +465,32 @@ internal sealed unsafe class AudioCapture : IDisposable
             ring = FreeRing();
             if (ring is null)
             {
-                Event($"{input.Name}: no free timeline buffer for \"{endpoint.Name}\"; it is metered but not recorded.");
+                // Every buffer still holds audio the mixer has not read (a burst of device switches): a stream
+                // without one would run but never reach the file. Try again in a moment.
+                if (!endpoint.WaitingForRing)
+                {
+                    endpoint.WaitingForRing = true;
+                    Event($"{input.Name}: waiting for a free timeline buffer for \"{endpoint.Name}\".");
+                }
+
+                endpoint.RetryAt = now + RetryDelays[0];
+                return;
             }
         }
 
+        endpoint.WaitingForRing = false;
         endpoint.Worker = new CaptureWorker(endpoint.Id, endpoint.Name, input.Loopback, ring, _anchor, _ => _wake.Set());
         endpoint.WasRunning = false;
-        if (endpoint.FailedAttempts > 0)
+        if (endpoint.FailedAttempts > 0 && Worth(endpoint.FailedAttempts))
         {
             Event($"{input.Name}: retrying \"{endpoint.Name}\" (attempt {endpoint.FailedAttempts + 1}).");
         }
 
         endpoint.Worker.Start();
     }
+
+    /// <summary>The first three attempts are logged, then every 30th (once a minute at one try per 2 s).</summary>
+    private static bool Worth(int attempts) => attempts <= 3 || attempts % 30 == 0;
 
     /// <summary>Notices captures that started running or failed.</summary>
     private void CheckWorkers(long now)
@@ -488,25 +515,53 @@ internal sealed unsafe class AudioCapture : IDisposable
                         _reconcileNeeded |= input.Endpoints.Any(e => !e.Desired);
                         break;
                     case WorkerState.Failed or WorkerState.Stopped:
-                        endpoint.FailedAttempts++;
-                        long delay = RetryDelays[Math.Min(endpoint.FailedAttempts - 1, RetryDelays.Length - 1)];
-                        endpoint.RetryAt = now + delay;
-                        string what = endpoint.WasRunning ? "lost" : "could not open";
-                        Event($"{input.Name}: {what} \"{endpoint.Name}\": {worker.Failure ?? "the stream ended"}. Silence is recorded; retrying in {delay / 10_000} ms.");
-                        if (!input.Loopback && endpoint.FailedAttempts >= 3 && !IsSuppressed(endpoint.Id, now))
-                        {
-                            _suppressedUntil[endpoint.Id] = now + Suppression;
-                            Event($"{input.Name}: \"{endpoint.Name}\" failed {endpoint.FailedAttempts} times in a row; trying another microphone for 10 s.");
-                        }
-
-                        Finish(worker);
-                        endpoint.Worker = null;
-                        endpoint.WasRunning = false;
-                        _reconcileNeeded = true;
+                        Failed(input, endpoint, worker, worker.Failure ?? "the stream ended", now);
+                        break;
+                    case WorkerState.Opening when now - worker.StartedHns > OpenTimeout:
+                        // A driver blocking inside Activate or Initialize: give up on this attempt (the thread is left
+                        // to finish on its own, its buffer stays reserved) and try again.
+                        worker.RequestStop();
+                        Failed(input, endpoint, worker, "the device did not open within 5 s (its driver is not responding)", now);
                         break;
                 }
             }
         }
+    }
+
+    private void Failed(Input input, Endpoint endpoint, CaptureWorker worker, string reason, long now)
+    {
+        endpoint.FailedAttempts++;
+        long delay = RetryDelays[Math.Min(endpoint.FailedAttempts - 1, RetryDelays.Length - 1)];
+        endpoint.RetryAt = now + delay;
+        if (Worth(endpoint.FailedAttempts))
+        {
+            string what = endpoint.WasRunning ? "lost" : "could not open";
+            string count = endpoint.FailedAttempts > 3 ? $" ({endpoint.FailedAttempts} attempts so far)" : "";
+            Event($"{input.Name}: {what} \"{endpoint.Name}\": {reason}{count}. Silence is recorded; retrying in {delay / 10_000} ms.");
+        }
+
+        if (!input.Loopback && endpoint.FailedAttempts >= 3 && !IsSuppressed(endpoint.Id, now))
+        {
+            _suppressedUntil[endpoint.Id] = now + Suppression;
+            if (Worth(endpoint.FailedAttempts))
+            {
+                Event($"{input.Name}: \"{endpoint.Name}\" failed {endpoint.FailedAttempts} times in a row; trying another microphone for 10 s.");
+            }
+        }
+
+        if (!endpoint.WasRunning)
+        {
+            lock (_gate)
+            {
+                (int count, _) = _failedOpens.GetValueOrDefault(endpoint.Name);
+                _failedOpens[endpoint.Name] = (count + 1, reason);
+            }
+        }
+
+        Finish(worker);
+        endpoint.Worker = null;
+        endpoint.WasRunning = false;
+        _reconcileNeeded = true;
     }
 
     /// <summary>Digital silence on the microphone, and how long each input has been without a running capture.</summary>
@@ -611,6 +666,10 @@ internal sealed unsafe class AudioCapture : IDisposable
     {
         lock (_gate)
         {
+            // Streams that never delivered audio are only counted (see _failedOpens); once their thread has ended
+            // and their buffer is empty there is nothing left to track, so a device failing for an hour cannot grow
+            // this list.
+            _finished.RemoveAll(w => w.Packets == 0 && w.EndedHns != 0 && (w.Ring is null || w.Ring.IsDrained));
             _finished.Add(worker);
         }
     }
@@ -631,6 +690,7 @@ internal sealed unsafe class AudioCapture : IDisposable
                 }
             }
 
+            input.Close();
             if (input.MissingSince != 0)
             {
                 long end = Interlocked.Read(ref _timelineEnd);
@@ -714,6 +774,8 @@ internal sealed unsafe class AudioCapture : IDisposable
 
         public bool WasRunning { get; set; }
 
+        public bool WaitingForRing { get; set; }
+
         public int FailedAttempts { get; set; }
 
         public long RetryAt { get; set; }
@@ -725,6 +787,7 @@ internal sealed unsafe class AudioCapture : IDisposable
         private readonly List<string> _devicesUsed = new();
         private float _level;
         private bool _published;
+        private bool _closed;
 
         public Input(string name, bool loopback, string? pinnedId, string mode)
         {
@@ -757,6 +820,12 @@ internal sealed unsafe class AudioCapture : IDisposable
 
         public InputState State { get; private set; } = InputState.Resolving;
 
+        /// <summary>The state before the devices were closed at the end (for the report).</summary>
+        public InputState FinalState { get; private set; } = InputState.Resolving;
+
+        /// <summary>The recording is over; the devices are closed on purpose.</summary>
+        public void Close() => _closed = true;
+
         public string Devices { get; private set; } = "";
 
         internal List<Endpoint> Endpoints { get; } = new();
@@ -774,7 +843,8 @@ internal sealed unsafe class AudioCapture : IDisposable
             InputState previous = State;
             List<Endpoint> desired = Endpoints.Where(e => e.Desired).ToList();
             bool anyRunning = Endpoints.Any(e => e.Worker?.State == WorkerState.Running);
-            State = desired.Count == 0 && !anyRunning ? InputState.NoDevice
+            State = _closed ? InputState.Closed
+                : desired.Count == 0 && !anyRunning ? InputState.NoDevice
                 : desired.Any(e => e.Worker?.State == WorkerState.Running) || anyRunning ? (Fallback ? InputState.Fallback : InputState.Running)
                 : desired.Any(e => e.Worker?.State == WorkerState.Opening) ? (desired.Any(e => e.FailedAttempts > 0) ? InputState.Retrying : InputState.Resolving)
                 : desired.Any(e => e.FailedAttempts > 0) ? InputState.Lost
@@ -802,7 +872,20 @@ internal sealed unsafe class AudioCapture : IDisposable
             }
 
             Devices = parts.Count > 0 ? string.Join(" + ", parts) : NoDeviceReason ?? "none";
+            if (State != InputState.Closed)
+            {
+                FinalState = State;
+            }
+
             if (State == previous && _published)
+            {
+                return null;
+            }
+
+            // A device failing again and again: Lost <-> Retrying is logged for the first attempts, then once a minute.
+            int attempts = desired.Count == 0 ? 0 : desired.Max(e => e.FailedAttempts);
+            if (_published && previous is InputState.Lost or InputState.Retrying && State is InputState.Lost or InputState.Retrying
+                && !(attempts <= 3 || attempts % 30 == 0))
             {
                 return null;
             }
@@ -831,7 +914,7 @@ internal sealed unsafe class AudioCapture : IDisposable
         public string Describe()
         {
             var text = new StringBuilder();
-            text.Append($"{State}; {Mode}; devices used: {(_devicesUsed.Count == 0 ? "none" : string.Join(", ", _devicesUsed.Select(d => $"\"{d}\"")))}");
+            text.Append($"{FinalState}; {Mode}; devices used: {(_devicesUsed.Count == 0 ? "none" : string.Join(", ", _devicesUsed.Select(d => $"\"{d}\"")))}");
             text.Append(string.Create(CultureInfo.InvariantCulture, $"; without a device for {MissingSeconds:0.0} s in total"));
             if (DigitalSilenceEpisodes > 0)
             {

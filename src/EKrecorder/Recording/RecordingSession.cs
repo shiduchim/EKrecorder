@@ -55,6 +55,7 @@ internal sealed unsafe class RecordingSession
     private readonly string _borderlessAccess;
     private readonly bool _simulateFirstSetupFailure;
     private readonly AudioSelection? _audioSelection;
+    private TimelineClock? _audioClock;
     private readonly List<string> _fallbacks = new();
     private readonly StringBuilder _setupFailures = new();
     private HeldFrame? _latest;
@@ -240,7 +241,7 @@ internal sealed unsafe class RecordingSession
             }
 
             route = OpenRoute(device, d3dDevice, out long firstFrameWritten);
-            StartAudioTimeline(route, firstFrameWritten);
+            StartMixer(route);
             started = true;
             _started.TrySetResult(this);
             RunFrames(route, adapter3, firstFrameWritten);
@@ -387,6 +388,9 @@ internal sealed unsafe class RecordingSession
                 }
 
                 firstFrameWritten = Stopwatch.GetTimestamp();
+                // The audio timeline starts with this frame, before it is encoded, so the file's first moments have
+                // sound too. A refused set-up re-anchors it on the next set-up's frame 0.
+                AnchorAudio(route, firstFrameWritten);
                 if (!ProduceFrame(0, route))
                 {
                     throw new InvalidOperationException("Frame 0 could not be written.");
@@ -421,24 +425,36 @@ internal sealed unsafe class RecordingSession
     /// Starts the audio timeline at video frame 0 (minus <see cref="AudioOffset"/>) and the mixer that feeds the
     /// file's audio track.
     /// </summary>
-    private void StartAudioTimeline(Route route, long firstFrameWritten)
+    private void AnchorAudio(Route route, long firstFrameWritten)
+    {
+        if (Audio is null || !route.Writer.HasAudio)
+        {
+            return;
+        }
+
+        long startHns = TimelineClock.ToHns(firstFrameWritten, Stopwatch.Frequency) - AudioOffset.Ticks;
+        _audioClock = new TimelineClock(startHns);
+        Audio.BeginTimeline(_audioClock);
+    }
+
+    /// <summary>Starts the mixer that feeds the file's audio track, once the set-up is chosen.</summary>
+    private void StartMixer(Route route)
     {
         if (Audio is null)
         {
             return;
         }
 
-        long startHns = TimelineClock.ToHns(firstFrameWritten, Stopwatch.Frequency) - AudioOffset.Ticks;
-        var clock = new TimelineClock(startHns);
-        Audio.BeginTimeline(clock);
-        if (!route.Writer.HasAudio)
+        if (!route.Writer.HasAudio || _audioClock is null)
         {
+            // No audio track: nothing to record, so no device stays open.
             AudioError = route.Writer.AudioError ?? "the file has no audio track";
             Stats.AddError($"No audio track: {AudioError}");
+            Audio.Stop();
             return;
         }
 
-        Mixer = new AudioMixer(Audio.Rings, clock, route.Writer.WriteAudio);
+        Mixer = new AudioMixer(Audio.Rings, _audioClock, route.Writer.WriteAudio);
         Mixer.Start();
     }
 
@@ -451,19 +467,33 @@ internal sealed unsafe class RecordingSession
             if (Mixer is not null)
             {
                 long endFrame = Slots * TimelineClock.SampleRate / Preset.FramesPerSecond;
-                Mixer.Finish(endFrame, TimeSpan.FromSeconds(5));
+                if (!Mixer.Finish(endFrame, TimeSpan.FromSeconds(5)))
+                {
+                    Stats.AddError("The audio mixer did not finish within 5 s; the end of the audio track may be missing.");
+                }
+
                 if (Mixer.Error is not null)
                 {
                     Stats.AddError($"The audio track ended early: {Mixer.Error}");
                 }
             }
-
-            Audio?.Stop();
         }
         catch (Exception ex)
         {
             Log.Error("Finishing the audio failed", ex);
             Stats.AddError($"Finishing the audio failed: {ex.Message}");
+        }
+        finally
+        {
+            // Whatever happened above, no audio device stays open after the recording.
+            try
+            {
+                Audio?.Stop();
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Closing the audio devices failed", ex);
+            }
         }
     }
 

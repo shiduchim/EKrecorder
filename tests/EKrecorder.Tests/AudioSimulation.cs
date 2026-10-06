@@ -53,7 +53,7 @@ internal sealed class SimulatedDevice
     }
 
     /// <summary>Captures one packet into the writer; returns the true time at its end (when it is delivered).</summary>
-    public double CapturePacket(TimelineWriter writer, double timestampOffsetSeconds = 0)
+    public double CapturePacket(TimelineWriter writer, double timestampOffsetSeconds = 0, bool discontinuity = false)
     {
         double start = Now;
         for (int i = 0; i < _packetFrames; i++)
@@ -73,7 +73,7 @@ internal sealed class SimulatedDevice
         _frame += _packetFrames;
         double jitter = (_random.NextDouble() - 0.5) * 2 * _jitterSeconds;
         double timestamp = start + jitter + timestampOffsetSeconds;
-        writer.Write(_packet, _packetFrames, timestamp * TimelineClock.SampleRate);
+        writer.Write(_packet, _packetFrames, timestamp * TimelineClock.SampleRate, discontinuity);
         return Now;
     }
 }

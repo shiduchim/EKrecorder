@@ -52,6 +52,7 @@ internal sealed class SpikeForm : Form
     private bool _closeAfterStop;
     private AudioCapture? _meterAudio;
     private bool _fillingDevices;
+    private bool _refreshingDevices;
 
     public SpikeForm(bool selfTest, string outputRoot, RecordingFolders folders)
     {
@@ -448,9 +449,9 @@ internal sealed class SpikeForm : Form
         // The build machine has no sound devices: the audio track must still be there, silent, as long as the video.
         AudioTrackCheck? audioTrack = finished?.Check?.Audio;
         bool audioOk = audioTrack is { Present: true }
-            && Math.Abs(audioTrack.Duration.TotalSeconds - finished!.Check!.Duration.TotalSeconds) < 0.1;
+            && Math.Abs(audioTrack.Duration.TotalSeconds - finished!.Check!.VideoDuration.TotalSeconds) < 0.1;
         bool passed = finished is { Saved: true } && fallbackShown && audioOk;
-        Log.Info($"{name}: {(passed ? "PASS" : "FAIL")} (saved: {finished?.Saved == true}; set-up failure reported: {fallbackShown}; audio track: {audioTrack?.Describe() ?? "none"}; video {finished?.Check?.Duration.TotalSeconds:0.000} s; {session.FramePath})");
+        Log.Info($"{name}: {(passed ? "PASS" : "FAIL")} (saved: {finished?.Saved == true}; set-up failure reported: {fallbackShown}; audio track: {audioTrack?.Describe() ?? "none"}; video track {finished?.Check?.VideoDuration.TotalSeconds:0.000} s; {session.FramePath})");
         return passed;
     }
 
@@ -553,12 +554,12 @@ internal sealed class SpikeForm : Form
     /// <summary>Fills the device lists (on a background thread; listing does not open any device).</summary>
     private async Task RefreshAudioDevicesAsync()
     {
-        if (_fillingDevices)
+        if (_refreshingDevices)
         {
             return;
         }
 
-        _fillingDevices = true;
+        _refreshingDevices = true;
         try
         {
             (List<AudioDevice> mics, List<AudioDevice> outputs) = await Task.Run(() => (CoreAudio.ListMicrophones(), CoreAudio.ListOutputs()));
@@ -571,7 +572,7 @@ internal sealed class SpikeForm : Form
         }
         finally
         {
-            _fillingDevices = false;
+            _refreshingDevices = false;
         }
     }
 
@@ -586,12 +587,20 @@ internal sealed class SpikeForm : Form
             items.Add(new DeviceChoice(id, selected.Name, Connected: false));
         }
 
+        // Only while the list is rebuilt: the same choice is selected again, which is not a change.
         _fillingDevices = true;
-        box.BeginUpdate();
-        box.Items.Clear();
-        box.Items.AddRange(items.ToArray<object>());
-        box.SelectedItem = items.FirstOrDefault(i => i.Id == selected?.Id) ?? items[0];
-        box.EndUpdate();
+        try
+        {
+            box.BeginUpdate();
+            box.Items.Clear();
+            box.Items.AddRange(items.ToArray<object>());
+            box.SelectedItem = items.FirstOrDefault(i => i.Id == selected?.Id) ?? items[0];
+            box.EndUpdate();
+        }
+        finally
+        {
+            _fillingDevices = false;
+        }
     }
 
     private void OnAudioSelectionChanged()
@@ -664,6 +673,7 @@ internal sealed class SpikeForm : Form
             InputState.Lost => "Lost (silence recorded)",
             InputState.Retrying => "Retrying",
             InputState.NoDevice => "No device",
+            InputState.Closed => "Closed",
             _ => "Opening",
         };
         return status.Warning is null ? $"{state} · {status.Devices}" : $"{state} · {status.Devices}{Environment.NewLine}WARNING: {status.Warning}";
