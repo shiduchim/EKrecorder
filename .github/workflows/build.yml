@@ -41,9 +41,12 @@ jobs:
 
       - name: Publish one self-contained EKrecorder.exe (win-x64)
         shell: pwsh
+        # No single-file compression: a compressed bundle unpacks every library it loads into private memory
+        # (about 80 MB here). Uncompressed, the libraries are mapped straight from the .exe. The .exe gets bigger,
+        # the download zip stays about the same size.
         run: |
           dotnet publish src/EKrecorder/EKrecorder.csproj -c Release -r win-x64 --self-contained true `
-            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true `
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false `
             -o publish/EKrecorder
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item docs/HOW-TO-RUN.txt publish/EKrecorder/
