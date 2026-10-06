@@ -24,14 +24,18 @@ internal sealed record RecordingPreset(
     public long FrameTime(long index) => index * 10_000_000L / FramesPerSecond;
 
     /// <summary>
-    /// Fits the monitor inside MaxWidth × MaxHeight, keeps its aspect ratio and never upscales. Both sides are even,
-    /// as 4:2:0 video needs.
+    /// Fits the monitor inside MaxWidth × MaxHeight, keeps its aspect ratio and never upscales. The limit turns with
+    /// the monitor: a portrait monitor fits inside MaxHeight × MaxWidth (1080×1920), not into a 608×1080 strip.
+    /// Both sides are even, as 4:2:0 video needs.
     /// </summary>
     public Size OutputSizeFor(Size source)
     {
-        double scale = Math.Min(1.0, Math.Min((double)MaxWidth / source.Width, (double)MaxHeight / source.Height));
-        int width = Math.Min(MaxWidth, Math.Max(2, 2 * (int)Math.Round(source.Width * scale / 2, MidpointRounding.AwayFromZero)));
-        int height = Math.Min(MaxHeight, Math.Max(2, 2 * (int)Math.Round(source.Height * scale / 2, MidpointRounding.AwayFromZero)));
+        bool portrait = source.Height > source.Width;
+        int maxWidth = portrait ? MaxHeight : MaxWidth;
+        int maxHeight = portrait ? MaxWidth : MaxHeight;
+        double scale = Math.Min(1.0, Math.Min((double)maxWidth / source.Width, (double)maxHeight / source.Height));
+        int width = Math.Min(maxWidth, Math.Max(2, 2 * (int)Math.Round(source.Width * scale / 2, MidpointRounding.AwayFromZero)));
+        int height = Math.Min(maxHeight, Math.Max(2, 2 * (int)Math.Round(source.Height * scale / 2, MidpointRounding.AwayFromZero)));
         if (width > source.Width)
         {
             width = source.Width & ~1;

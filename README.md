@@ -10,7 +10,8 @@ This repository holds the test build. **Step 1** (done) proved the monitor, capt
 - Records the selected whole monitor to an MP4 file with Windows.Graphics.Capture.
 - Default preset: at most 1920×1080, 15 fps, H.264 High profile, about 2 Mbps average and 6 Mbps peak (VBR), a
   keyframe every 2 seconds. The output size is fixed for the recording, keeps the monitor's aspect ratio and never
-  upscales: a 4K monitor becomes 1920×1080, a 1366×768 monitor stays 1366×768.
+  upscales: a 4K monitor becomes 1920×1080, a 1366×768 monitor stays 1366×768, and a portrait (vertical) monitor
+  gets at most 1080×1920.
 - Paces the output at 15 fps on the QueryPerformanceCounter clock. When the screen has not changed, the previous
   picture is repeated ("duplicated frame"), so the file has a constant frame rate.
 - Keeps frames on the GPU: the Direct3D 11 video processor scales and converts BGRA to NV12, and the frames go

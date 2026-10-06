@@ -13,6 +13,11 @@ namespace EKrecorder.Recording;
 /// </summary>
 internal sealed unsafe class GpuFrameConverter : IDisposable
 {
+    // Views are cached per texture. The capture pool and the sample pool reuse a few textures, so the caches stay
+    // small; this limit only guards against a driver that hands out new textures all the time (each cached view
+    // keeps its texture alive).
+    private const int MaxCachedViews = 16;
+
     private readonly ID3D11Device* _device;
     private readonly ID3D11DeviceContext* _context;
     private readonly ID3D11VideoDevice* _videoDevice;
@@ -21,6 +26,7 @@ internal sealed unsafe class GpuFrameConverter : IDisposable
     private ID3D11Texture2D* _intermediate;
     private Size _intermediateSize;
     private bool _copyFirst;
+    private bool _cacheWarned;
     private readonly Dictionary<nint, nint> _inputViews = new();
     private readonly Dictionary<(nint Texture, uint Subresource), nint> _outputViews = new();
     private ID3D11VideoProcessorEnumerator* _enumerator;
@@ -273,6 +279,12 @@ internal sealed unsafe class GpuFrameConverter : IDisposable
             return (ID3D11VideoProcessorInputView*)cached;
         }
 
+        if (_inputViews.Count >= MaxCachedViews)
+        {
+            WarnCacheFull("input");
+            ReleaseViews(_inputViews);
+        }
+
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC description = default;
         description.FourCC = 0;
         description.ViewDimension = D3D11_VPIV_DIMENSION.D3D11_VPIV_DIMENSION_TEXTURE2D;
@@ -291,6 +303,12 @@ internal sealed unsafe class GpuFrameConverter : IDisposable
         if (_outputViews.TryGetValue(((nint)texture, subresource), out nint cached))
         {
             return (ID3D11VideoProcessorOutputView*)cached;
+        }
+
+        if (_outputViews.Count >= MaxCachedViews)
+        {
+            WarnCacheFull("output");
+            ReleaseViews(_outputViews);
         }
 
         D3D11_TEXTURE2D_DESC textureDescription;
@@ -318,20 +336,31 @@ internal sealed unsafe class GpuFrameConverter : IDisposable
         return view;
     }
 
+    /// <summary>Releases every view in a cache (input and output views are both plain COM objects).</summary>
+    private static void ReleaseViews<TKey>(Dictionary<TKey, nint> views)
+        where TKey : notnull
+    {
+        foreach (nint view in views.Values)
+        {
+            ((IUnknown*)view)->Release();
+        }
+
+        views.Clear();
+    }
+
+    private void WarnCacheFull(string kind)
+    {
+        if (!_cacheWarned)
+        {
+            _cacheWarned = true;
+            Log.Warn($"More than {MaxCachedViews} different {kind} textures; the video processor's view cache is cleared and refilled.");
+        }
+    }
+
     private void ReleaseProcessor()
     {
-        foreach (nint view in _inputViews.Values)
-        {
-            ((ID3D11VideoProcessorInputView*)view)->Release();
-        }
-
-        foreach (nint view in _outputViews.Values)
-        {
-            ((ID3D11VideoProcessorOutputView*)view)->Release();
-        }
-
-        _inputViews.Clear();
-        _outputViews.Clear();
+        ReleaseViews(_inputViews);
+        ReleaseViews(_outputViews);
         if (_processor != null)
         {
             _processor->Release();
