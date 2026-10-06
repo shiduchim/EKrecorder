@@ -70,7 +70,7 @@ internal static class Program
 
         Log.Info($"Data in {paths.Root}; recordings go to {paths.RecordingsFolder(settings)}.");
         List<Leftover> leftovers = RecoveryService.FindLeftovers(paths);
-        using (var app = new TrayApplication(paths, store, settings, firstRun: !existed, leftovers, instance, showSettings: !background || !existed))
+        using (var app = new TrayApplication(paths, store, settings, firstRun: !existed, leftovers, instance, showSettings: !background))
         {
             instance.StartListening();
             Application.Run(app);
