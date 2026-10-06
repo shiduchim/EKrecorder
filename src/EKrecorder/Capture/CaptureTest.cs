@@ -725,7 +725,32 @@ internal sealed class CaptureTest
         }
 
         report.Add(Pass, "Windows.Graphics.Capture is supported");
-        report.Add(_programmaticAccess.Allowed ? Pass : Warn, $"Windows allows this app to capture the screen: {_programmaticAccess.Text}");
+
+        long frames;
+        double latencyAverage;
+        double latencyMax;
+        lock (_gate)
+        {
+            frames = _frameCount;
+            latencyAverage = frames > 0 ? _latencySumMs / frames : 0;
+            latencyMax = _latencyMaxMs;
+        }
+
+        // A desktop app can capture even when this permission reads "Denied" (seen on the build machine), so the
+        // permission only fails the test when the capture itself did not work.
+        if (_programmaticAccess.Allowed)
+        {
+            report.Add(Pass, "Windows allows this app to capture the screen (GraphicsCaptureAccess: Allowed)");
+        }
+        else if (frames > 0)
+        {
+            report.Add(Info, $"GraphicsCaptureAccess reports \"{_programmaticAccess.Text}\" for screen capture, but the capture worked anyway");
+        }
+        else
+        {
+            report.Add(Fail, $"Windows may be blocking screen capture for this app (GraphicsCaptureAccess: {_programmaticAccess.Text})");
+        }
+
         if (_captureError is not null)
         {
             report.Add(Fail, $"The capture could not run: {_captureError}");
@@ -741,16 +766,6 @@ internal sealed class CaptureTest
             bool whole = itemSize.Width == monitor.Bounds.Width && itemSize.Height == monitor.Bounds.Height;
             report.Add(whole ? Pass : Fail,
                 $"Capture covers the whole of {monitor.Name}: {itemSize.Width}x{itemSize.Height} captured, monitor is {monitor.Bounds.Width}x{monitor.Bounds.Height}");
-        }
-
-        long frames;
-        double latencyAverage;
-        double latencyMax;
-        lock (_gate)
-        {
-            frames = _frameCount;
-            latencyAverage = frames > 0 ? _latencySumMs / frames : 0;
-            latencyMax = _latencyMaxMs;
         }
 
         if (_captureStarted)
@@ -785,8 +800,9 @@ internal sealed class CaptureTest
         }
         else if (_borderRequiredAfterSet == false)
         {
-            report.Add(_borderlessAccess.Allowed ? Pass : Warn,
-                $"Capture border turned off through the API: IsBorderRequired reads back False (borderless access: {_borderlessAccess.Text})");
+            // Whether the border really disappeared is the Yes/No question below; Windows draws it on the screen.
+            report.Add(Pass,
+                $"Capture border turned off through the API: IsBorderRequired reads back False (GraphicsCaptureAccess for borderless: {_borderlessAccess.Text})");
         }
         else if (_borderRequiredAfterSet == true)
         {
