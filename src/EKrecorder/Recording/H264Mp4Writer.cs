@@ -118,20 +118,20 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     /// <paramref name="withAudio"/>: add the AAC track (dropped, with <see cref="AudioError"/>, if it cannot be set up).
     /// </summary>
     public static H264Mp4Writer Create(
-        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter, bool withAudio)
+        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter, bool withAudio, bool fragmented = false)
     {
         var failures = new List<string>();
         string? audioError = null;
         foreach (Plan plan in Plans(preset))
         {
-            H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, withAudio, out string failure, out bool audioFailed);
+            H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, withAudio, fragmented, out string failure, out bool audioFailed);
             if (writer is null && withAudio && audioFailed)
             {
                 // The video side was fine; record without audio rather than not at all, and say so loudly.
                 audioError = failure;
                 withAudio = false;
                 Log.Error($"The AAC audio track could not be set up ({failure}); recording video without audio.");
-                writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, false, out failure, out _);
+                writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, false, fragmented, out failure, out _);
             }
 
             if (writer is not null)
@@ -367,7 +367,7 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     }
 
     private static H264Mp4Writer? TryCreate(
-        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardware, Plan plan, bool withAudio, out string failure, out bool audioFailed)
+        string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardware, Plan plan, bool withAudio, bool fragmented, out string failure, out bool audioFailed)
     {
         failure = "";
         audioFailed = false;
@@ -395,7 +395,9 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             }
 
             Check(attributes->SetUINT32(Ptr(in MF.MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS), hardware ? 1u : 0u), "set MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS");
-            Check(attributes->SetGUID(Ptr(in MF.MF_TRANSCODE_CONTAINERTYPE), Ptr(in MFTranscodeContainerType.MFTranscodeContainerType_MPEG4)), "set MF_TRANSCODE_CONTAINERTYPE");
+            Check(attributes->SetGUID(Ptr(in MF.MF_TRANSCODE_CONTAINERTYPE), fragmented
+                ? Ptr(in MFTranscodeContainerType.MFTranscodeContainerType_FMPEG4)
+                : Ptr(in MFTranscodeContainerType.MFTranscodeContainerType_MPEG4)), "set MF_TRANSCODE_CONTAINERTYPE");
             fixed (char* file = path)
             {
                 Check(MFCreateSinkWriterFromURL(file, null, attributes, &writer), "MFCreateSinkWriterFromURL");

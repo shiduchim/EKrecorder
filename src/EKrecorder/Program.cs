@@ -41,6 +41,14 @@ internal static class Program
             e.SetObserved();
         };
 
+        if (ArgumentValue(args, "--probe") is { } probeFolder)
+        {
+            int probeCode = EncoderProbe.Run(probeFolder);
+            MediaFoundation.Shutdown();
+            Log.Stop();
+            return probeCode;
+        }
+
         if (selfTest)
         {
             _watchdog = new System.Threading.Timer(

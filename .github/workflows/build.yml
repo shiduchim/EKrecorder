@@ -59,6 +59,25 @@ jobs:
           Copy-Item docs/HOW-TO-RUN.txt publish/EKrecorder/
           Get-ChildItem publish/EKrecorder | Format-Table Name, Length -AutoSize
 
+      - name: Encoder probe (informational)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'probe'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = (Resolve-Path 'publish/EKrecorder/EKrecorder.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList @('--probe', "`"$out`"") -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; Write-Host '::warning::probe hung' }
+          Get-Content (Join-Path $out 'probe-report.txt') -ErrorAction SilentlyContinue | Write-Host
+          Write-Host '===== tools on this machine ====='
+          foreach ($tool in 'iscc', 'ffmpeg', 'ffprobe', 'choco') {
+            $found = Get-Command $tool -ErrorAction SilentlyContinue
+            Write-Host "$tool : $(if ($found) { $found.Source } else { 'not found' })"
+          }
+          Get-ChildItem 'C:\Program Files (x86)\Inno Setup*', 'C:\Program Files\Inno Setup*' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Inno folder: $($_.FullName)" }
+          Write-Host "Runner image: $env:ImageOS $env:ImageVersion"
+
       # Runs the capture test and a 6-second recording on the build machine's virtual screen, without questions. It
       # shows whether the app starts and the Windows APIs answer on a real Windows. It never blocks the download below:
       # the build machine has no real monitor or GPU, so the test on your own PC is the one that counts.
@@ -96,6 +115,15 @@ jobs:
           path: publish/EKrecorder/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload the probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-results
+          path: ${{ runner.temp }}/probe/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload the self-test results
         if: always()
