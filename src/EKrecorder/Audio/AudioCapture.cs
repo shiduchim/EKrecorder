@@ -179,7 +179,8 @@ internal sealed unsafe class AudioCapture : IDisposable
     {
         lock (_gate)
         {
-            return _finished.Where(w => w.Packets > 0).Select(DescribeWorker)
+            // Every stream that opened, including an output nothing was played on (it delivers no packets).
+            return _finished.Where(w => w.Packets > 0 || w.Format.Length > 0).Select(DescribeWorker)
                 .Concat(_failedOpens.Select(f => $"\"{f.Key}\": could not be opened {f.Value.Count} time(s); last reason: {f.Value.Reason}"))
                 .ToArray();
         }
@@ -397,6 +398,7 @@ internal sealed unsafe class AudioCapture : IDisposable
 
         input.Fallback = fallback;
         input.NoDeviceReason = targets.Length == 0 ? $"Windows reports no {(input.Loopback ? "output device" : "microphone")}" : null;
+        bool firstDevices = input.Endpoints.Count == 0;
         foreach (string id in targets)
         {
             Endpoint? endpoint = input.Find(id);
@@ -404,9 +406,10 @@ internal sealed unsafe class AudioCapture : IDisposable
             {
                 endpoint = new Endpoint(id, NameFor(enumerator, id)) { RetryAt = now };
                 input.Endpoints.Add(endpoint);
-                if (input.Endpoints.Count > 1 || _anchor.Clock is not null)
+                if (!firstDevices)
                 {
-                    Event($"{input.Name}: switching to \"{endpoint.Name}\".");
+                    // The first devices show in the state line; later ones are a change worth a line of their own.
+                    Event($"{input.Name}: now using \"{endpoint.Name}\".");
                 }
             }
 
@@ -750,7 +753,9 @@ internal sealed unsafe class AudioCapture : IDisposable
     private static string DescribeWorker(CaptureWorker worker)
     {
         string late = worker.Ring is { } ring ? $", late samples dropped {ring.LateSamples:N0}" : "";
-        string level = worker.MaxPeak > 0 ? $"{20 * Math.Log10(worker.MaxPeak):0.0} dBFS" : "silent";
+        string level = worker.MaxPeak > 0 ? $"{20 * Math.Log10(worker.MaxPeak):0.0} dBFS"
+            : worker.Packets == 0 && worker.Loopback ? "silent (nothing was played on it)"
+            : "silent";
         return string.Create(CultureInfo.InvariantCulture,
             $"{(worker.Loopback ? "Computer audio" : "Microphone")} \"{worker.Name}\": {(worker.Format.Length > 0 ? worker.Format : "did not open")}; {worker.Packets:N0} packets, {worker.Frames / (double)TimelineClock.SampleRate:0.0} s; peak {level}; drift corrected {worker.DriftPpm:+0;-0;0} ppm; re-placed {worker.Resyncs} time(s); Windows-flagged gaps {worker.Discontinuities}; estimated timestamps {worker.EstimatedTimestamps}{late}; longest digital silence {worker.LongestDigitalSilenceSeconds:0.0} s{(worker.Failure is null ? "" : $"; ended: {worker.Failure}")}");
     }
@@ -879,6 +884,13 @@ internal sealed unsafe class AudioCapture : IDisposable
 
             if (State == previous && _published)
             {
+                return null;
+            }
+
+            if (State == previous)
+            {
+                // The first look, before anything happened: nothing worth a line.
+                _published = true;
                 return null;
             }
 
