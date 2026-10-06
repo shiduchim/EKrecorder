@@ -11,6 +11,10 @@ namespace EKrecorder.Capture;
 /// The Direct3D 11 device that Windows.Graphics.Capture delivers frames on, wrapped as a WinRT IDirect3DDevice.
 /// It is created on the GPU that drives the captured monitor when that GPU can be found, so frames do not have to
 /// cross between graphics adapters; otherwise on the default GPU, and as a last resort on WARP (software).
+/// <para>
+/// For recording, the device also asks for video support (the D3D11 video processor and hardware encoders use it)
+/// and keeps the raw ID3D11Device pointer in <see cref="NativeDevice"/>.
+/// </para>
 /// </summary>
 internal sealed unsafe class CaptureDevice : IDisposable
 {
@@ -18,41 +22,53 @@ internal sealed unsafe class CaptureDevice : IDisposable
     private const int D3D_DRIVER_TYPE_HARDWARE = 1;
     private const int D3D_DRIVER_TYPE_WARP = 5;
     private const uint D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20;
+    private const uint D3D11_CREATE_DEVICE_VIDEO_SUPPORT = 0x800;
     private const uint D3D11_SDK_VERSION = 7;
     private const int DXGI_ERROR_NOT_FOUND = unchecked((int)0x887A0002);
 
     private static readonly Guid IID_IDXGIDevice = new("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
     private static readonly Guid IID_IDXGIFactory1 = new("770aae78-f26f-4dba-a829-253c83d1b387");
 
-    private CaptureDevice(IDirect3DDevice device, string description)
+    private CaptureDevice(IDirect3DDevice device, IntPtr nativeDevice, string description, AdapterInfo adapter, bool hasVideoSupport)
     {
         Device = device;
+        NativeDevice = nativeDevice;
         Description = description;
+        Adapter = adapter;
+        HasVideoSupport = hasVideoSupport;
     }
 
     public IDirect3DDevice Device { get; }
 
+    /// <summary>The ID3D11Device behind <see cref="Device"/>. This object owns one reference; it is released in Dispose.</summary>
+    public IntPtr NativeDevice { get; private set; }
+
     public string Description { get; }
 
-    public static CaptureDevice CreateForMonitor(IntPtr monitor)
+    public AdapterInfo Adapter { get; }
+
+    /// <summary>True when the device was created with D3D11_CREATE_DEVICE_VIDEO_SUPPORT.</summary>
+    public bool HasVideoSupport { get; }
+
+    public static CaptureDevice CreateForMonitor(IntPtr monitor, bool forRecording = false)
     {
         IntPtr adapter = FindAdapterForMonitor(monitor, out string adapterName);
         try
         {
             if (adapter != IntPtr.Zero
-                && TryCreate(adapter, D3D_DRIVER_TYPE_UNKNOWN, $"the GPU driving this monitor (\"{adapterName}\")", out CaptureDevice? device))
+                && TryCreate(adapter, D3D_DRIVER_TYPE_UNKNOWN, $"the GPU driving this monitor (\"{adapterName}\")", forRecording, out CaptureDevice? device))
             {
                 return device;
             }
 
             Log.Decision("Using the default GPU for capture.");
-            if (TryCreate(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, "the default GPU", out device))
+            if (TryCreate(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, "the default GPU", forRecording, out device))
             {
                 return device;
             }
 
             Log.Decision("No hardware Direct3D 11 device; falling back to WARP (software rendering).");
-            if (TryCreate(IntPtr.Zero, D3D_DRIVER_TYPE_WARP, "WARP (software)", out device))
+            if (TryCreate(IntPtr.Zero, D3D_DRIVER_TYPE_WARP, "WARP (software)", forRecording, out device))
             {
                 return device;
             }
@@ -68,15 +84,35 @@ internal sealed unsafe class CaptureDevice : IDisposable
         }
     }
 
-    public void Dispose() => Device.Dispose();
+    public void Dispose()
+    {
+        Device.Dispose();
+        if (NativeDevice != IntPtr.Zero)
+        {
+            Marshal.Release(NativeDevice);
+            NativeDevice = IntPtr.Zero;
+        }
+    }
 
-    private static bool TryCreate(IntPtr adapter, int driverType, string label, [NotNullWhen(true)] out CaptureDevice? created)
+    private static bool TryCreate(IntPtr adapter, int driverType, string label, bool forRecording, [NotNullWhen(true)] out CaptureDevice? created)
     {
         created = null;
-        int hr = D3D11CreateDevice(adapter, driverType, IntPtr.Zero, D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0,
+        uint flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | (forRecording ? D3D11_CREATE_DEVICE_VIDEO_SUPPORT : 0);
+        int hr = D3D11CreateDevice(adapter, driverType, IntPtr.Zero, flags, IntPtr.Zero, 0,
             D3D11_SDK_VERSION, out IntPtr d3dDevice, out int featureLevel, out IntPtr immediateContext);
-        Log.Api($"D3D11CreateDevice({label}, BGRA support)", hr >= 0,
+        Log.Api($"D3D11CreateDevice({label}, BGRA{(forRecording ? " + video" : "")} support)", hr >= 0,
             hr >= 0 ? $"feature level {FeatureLevelText(featureLevel)}" : Win32.Hr(hr));
+        bool hasVideoSupport = forRecording;
+        if (hr < 0 && forRecording)
+        {
+            Log.Decision($"This GPU has no Direct3D 11 video support ({Win32.Hr(hr)}); scaling will run on the CPU.");
+            hasVideoSupport = false;
+            hr = D3D11CreateDevice(adapter, driverType, IntPtr.Zero, D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0,
+                D3D11_SDK_VERSION, out d3dDevice, out featureLevel, out immediateContext);
+            Log.Api($"D3D11CreateDevice({label}, BGRA support)", hr >= 0,
+                hr >= 0 ? $"feature level {FeatureLevelText(featureLevel)}" : Win32.Hr(hr));
+        }
+
         if (hr < 0)
         {
             return false;
@@ -84,6 +120,7 @@ internal sealed unsafe class CaptureDevice : IDisposable
 
         IntPtr dxgiDevice = IntPtr.Zero;
         IntPtr inspectable = IntPtr.Zero;
+        bool keepDevice = false;
         try
         {
             hr = Marshal.QueryInterface(d3dDevice, in IID_IDXGIDevice, out dxgiDevice);
@@ -93,7 +130,7 @@ internal sealed unsafe class CaptureDevice : IDisposable
                 return false;
             }
 
-            string actualAdapter = DeviceAdapterName(dxgiDevice);
+            AdapterInfo actualAdapter = DeviceAdapter(dxgiDevice);
             hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice, out inspectable);
             if (hr < 0)
             {
@@ -103,7 +140,13 @@ internal sealed unsafe class CaptureDevice : IDisposable
 
             // FromAbi adds its own reference; ours is released in the finally block.
             IDirect3DDevice device = MarshalInterface<IDirect3DDevice>.FromAbi(inspectable);
-            created = new CaptureDevice(device, $"{label}: \"{actualAdapter}\", feature level {FeatureLevelText(featureLevel)}");
+            created = new CaptureDevice(
+                device,
+                forRecording ? d3dDevice : IntPtr.Zero,
+                $"{label}: \"{actualAdapter.Name}\", feature level {FeatureLevelText(featureLevel)}{(hasVideoSupport ? ", video support" : "")}",
+                actualAdapter,
+                hasVideoSupport);
+            keepDevice = forRecording;
             Log.Info($"Capture device ready on {created.Description}");
             return true;
         }
@@ -124,7 +167,10 @@ internal sealed unsafe class CaptureDevice : IDisposable
                 Marshal.Release(immediateContext);
             }
 
-            Marshal.Release(d3dDevice);
+            if (!keepDevice)
+            {
+                Marshal.Release(d3dDevice);
+            }
         }
     }
 
@@ -201,19 +247,19 @@ internal sealed unsafe class CaptureDevice : IDisposable
         return IntPtr.Zero;
     }
 
-    private static string DeviceAdapterName(IntPtr dxgiDevice)
+    private static AdapterInfo DeviceAdapter(IntPtr dxgiDevice)
     {
         IntPtr adapter;
         // IDXGIDevice::GetAdapter (IDXGIObject ends at 6, GetAdapter = 7)
         int hr = ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr*, int>)ComVtable.Slot(dxgiDevice, 7))(dxgiDevice, &adapter);
         if (hr < 0)
         {
-            return $"unknown GPU (IDXGIDevice::GetAdapter {Win32.Hr(hr)})";
+            return new AdapterInfo($"unknown GPU (IDXGIDevice::GetAdapter {Win32.Hr(hr)})", 0, 0);
         }
 
         try
         {
-            return AdapterName(adapter);
+            return DescribeAdapter(adapter);
         }
         finally
         {
@@ -221,14 +267,23 @@ internal sealed unsafe class CaptureDevice : IDisposable
         }
     }
 
-    private static string AdapterName(IntPtr adapter)
+    private static string AdapterName(IntPtr adapter) => DescribeAdapter(adapter).Name;
+
+    private static AdapterInfo DescribeAdapter(IntPtr adapter)
     {
         DXGI_ADAPTER_DESC description;
         // IDXGIAdapter::GetDesc (EnumOutputs = 7, GetDesc = 8)
         int hr = ((delegate* unmanaged[Stdcall]<IntPtr, DXGI_ADAPTER_DESC*, int>)ComVtable.Slot(adapter, 8))(adapter, &description);
-        return hr < 0
-            ? $"unknown GPU (IDXGIAdapter::GetDesc {Win32.Hr(hr)})"
-            : $"{new string((char*)description.Description)} (vendor 0x{description.VendorId:X4}, device 0x{description.DeviceId:X4})";
+        if (hr < 0)
+        {
+            return new AdapterInfo($"unknown GPU (IDXGIAdapter::GetDesc {Win32.Hr(hr)})", 0, 0);
+        }
+
+        long luid = ((long)description.AdapterLuid.HighPart << 32) | description.AdapterLuid.LowPart;
+        return new AdapterInfo(
+            $"{new string((char*)description.Description)} (vendor 0x{description.VendorId:X4}, device 0x{description.DeviceId:X4})",
+            description.VendorId,
+            luid);
     }
 
     private static string FeatureLevelText(int level) => $"{(level >> 12) & 0xF}_{(level >> 8) & 0xF}";
@@ -277,4 +332,18 @@ internal sealed unsafe class CaptureDevice : IDisposable
         public nuint SharedSystemMemory;
         public Win32.LUID AdapterLuid;
     }
+}
+
+/// <summary>The graphics adapter a device runs on. <see cref="VendorId"/> is the PCI vendor (0x10DE NVIDIA, 0x8086 Intel, 0x1002 AMD).</summary>
+internal sealed record AdapterInfo(string Name, uint VendorId, long Luid)
+{
+    public string VendorName => VendorId switch
+    {
+        0x10DE => "NVIDIA",
+        0x8086 => "Intel",
+        0x1002 or 0x1022 => "AMD",
+        0x5143 or 0x4D4F4351 => "Qualcomm",
+        0x1414 => "Microsoft",
+        _ => $"vendor 0x{VendorId:X4}",
+    };
 }

@@ -1,11 +1,12 @@
 using EKrecorder.Diagnostics;
+using EKrecorder.Recording;
 
 namespace EKrecorder;
 
 /// <summary>
-/// EKrecorder, Step 1 capture spike. Run without arguments for the test window.
-/// <c>--selftest [--output folder]</c> runs the test once on Monitor 1 without questions and exits with
-/// 0 (all checks passed), 1 (a check failed), 3 (the test crashed) or 4 (it hung).
+/// EKrecorder test build (Step 2: the recording engine). Run without arguments for the test window.
+/// <c>--selftest [--output folder]</c> runs the capture test and a 6-second recording on Monitor 1 without questions
+/// and exits with 0 (all passed), 1 (a check or the recording failed), 3 (a test crashed) or 4 (it hung).
 /// </summary>
 internal static class Program
 {
@@ -23,7 +24,9 @@ internal static class Program
             ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "EKrecorder test results");
 
         Log.Start();
-        Log.Info($"EKrecorder capture spike starting{(selfTest ? " in self-test mode" : "")}; results go to {outputRoot}");
+        RecordingFolders folders = selfTest ? RecordingFolders.Under(outputRoot) : RecordingFolders.Default;
+        Log.Info($"EKrecorder starting{(selfTest ? " in self-test mode" : "")}; test results go to {outputRoot}");
+        Log.Info($"Recordings: in progress {folders.InProgress}; finished {folders.Recordings}; reports {folders.Reports}");
         foreach (string line in EnvironmentInfo.Describe())
         {
             Log.Info(line);
@@ -53,13 +56,14 @@ internal static class Program
         }
 
         int exitCode;
-        using (var form = new SpikeForm(selfTest, outputRoot))
+        using (var form = new SpikeForm(selfTest, outputRoot, folders))
         {
             Application.Run(form);
             exitCode = form.ExitCode;
         }
 
         _watchdog?.Dispose();
+        MediaFoundation.Shutdown();
         Log.Info($"Exiting with code {exitCode}.");
         Log.Stop();
         return exitCode;

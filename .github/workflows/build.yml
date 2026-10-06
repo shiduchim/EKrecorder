@@ -49,9 +49,9 @@ jobs:
           Copy-Item docs/HOW-TO-RUN.txt publish/EKrecorder/
           Get-ChildItem publish/EKrecorder | Format-Table Name, Length -AutoSize
 
-      # Runs the same 10-second test on the build machine's virtual screen, without questions. It shows whether the
-      # app starts and the Windows APIs answer on a real Windows. It never blocks the download below: the build
-      # machine has no real monitor or GPU, so the test on your own PC is the one that counts.
+      # Runs the capture test and a 6-second recording on the build machine's virtual screen, without questions. It
+      # shows whether the app starts and the Windows APIs answer on a real Windows. It never blocks the download below:
+      # the build machine has no real monitor or GPU, so the test on your own PC is the one that counts.
       - name: Self-test on the build machine (informational)
         id: selftest
         continue-on-error: true
@@ -68,22 +68,21 @@ jobs:
           }
           $p.WaitForExit()
           $code = $p.ExitCode
-          foreach ($name in 'report.txt', 'log.txt') {
-            $file = Get-ChildItem $out -Recurse -Filter $name | Select-Object -First 1
-            if ($file) { Write-Host "===== $name ====="; Get-Content $file.FullName | Write-Host }
+          foreach ($file in Get-ChildItem $out -Recurse -Filter '*report*.txt') {
+            Write-Host "===== $($file.Name) ====="
+            Get-Content $file.FullName | Write-Host
           }
-          if (-not (Get-ChildItem $out -Recurse -Filter report.txt)) {
-            Write-Host '===== session log (no report was written) ====='
-            Get-ChildItem "$env:LOCALAPPDATA\EKrecorder\Logs" -Filter *.log -ErrorAction SilentlyContinue |
-              ForEach-Object { Get-Content $_.FullName | Write-Host }
-          }
+          Get-ChildItem $out -Recurse -Filter '*.mp4' | ForEach-Object { Write-Host "MP4: $($_.FullName) ($($_.Length) bytes)" }
+          Write-Host '===== session log ====='
+          Get-ChildItem "$env:LOCALAPPDATA\EKrecorder\Logs" -Filter *.log -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-Content $_.FullName | Write-Host }
           Write-Host "Self-test exit code: $code"
           exit $code
 
       - name: Upload EKrecorder (this is the one to download)
         uses: actions/upload-artifact@v4
         with:
-          name: EKrecorder-spike-win-x64
+          name: EKrecorder-win-x64
           path: publish/EKrecorder/
           if-no-files-found: error
           retention-days: 30

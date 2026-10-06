@@ -3,13 +3,11 @@ using System.Globalization;
 using EKrecorder.Diagnostics;
 using EKrecorder.Monitors;
 using EKrecorder.Overlays;
-using Windows.Foundation.Metadata;
 using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
 using Windows.Graphics.Imaging;
-using Windows.Security.Authorization.AppCapabilityAccess;
 
 namespace EKrecorder.Capture;
 
@@ -42,8 +40,6 @@ internal sealed class CaptureTest
     private const double VisibleShare = 0.5;
     private const double IdentifyVisibleShare = 0.3;
 
-    private const string SessionClass = "Windows.Graphics.Capture.GraphicsCaptureSession";
-
     private static readonly int[] SampleSeconds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     private static readonly int[] FullFrameSeconds = [1, 3, 6, 9];
 
@@ -75,8 +71,8 @@ internal sealed class CaptureTest
     private bool _perMonitorV2;
     private string _dpiAwareness = "";
     private bool _captureSupported;
-    private AccessResult _programmaticAccess = new(false, "not requested");
-    private AccessResult _borderlessAccess = new(false, "not requested");
+    private CaptureAccessResult _programmaticAccess = new(false, "not requested");
+    private CaptureAccessResult _borderlessAccess = new(false, "not requested");
     private bool _borderPropertyPresent;
     private bool? _borderRequiredAfterSet;
     private string? _borderSetError;
@@ -116,8 +112,8 @@ internal sealed class CaptureTest
         _captureSupported = IsCaptureSupported();
         if (_captureSupported)
         {
-            _programmaticAccess = await RequestAccessAsync(GraphicsCaptureAccessKind.Programmatic);
-            _borderlessAccess = await RequestAccessAsync(GraphicsCaptureAccessKind.Borderless);
+            _programmaticAccess = await CaptureSessionSetup.RequestAccessAsync(GraphicsCaptureAccessKind.Programmatic);
+            _borderlessAccess = await CaptureSessionSetup.RequestAccessAsync(GraphicsCaptureAccessKind.Borderless);
             await CaptureAsync(monitor);
         }
 
@@ -150,29 +146,6 @@ internal sealed class CaptureTest
         {
             Log.Error("GraphicsCaptureSession.IsSupported() threw", ex);
             return false;
-        }
-    }
-
-    /// <summary>Asks Windows whether this app may capture (Programmatic) and may hide the yellow border (Borderless).</summary>
-    private static async Task<AccessResult> RequestAccessAsync(GraphicsCaptureAccessKind kind)
-    {
-        if (!ApiInformation.IsTypePresent("Windows.Graphics.Capture.GraphicsCaptureAccess"))
-        {
-            Log.Warn("GraphicsCaptureAccess is not available on this Windows build.");
-            return new AccessResult(false, "not available on this Windows build");
-        }
-
-        try
-        {
-            AppCapabilityAccessStatus status = await GraphicsCaptureAccess.RequestAccessAsync(kind);
-            bool allowed = status == AppCapabilityAccessStatus.Allowed;
-            Log.Api($"GraphicsCaptureAccess.RequestAccessAsync({kind})", allowed, status.ToString());
-            return new AccessResult(allowed, status.ToString());
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"GraphicsCaptureAccess.RequestAccessAsync({kind}) threw", ex);
-            return new AccessResult(false, $"error {ex.GetType().Name} (HRESULT 0x{ex.HResult:X8})");
         }
     }
 
@@ -259,62 +232,11 @@ internal sealed class CaptureTest
 
     private void ConfigureSession(GraphicsCaptureSession session)
     {
-        // The yellow border. Needs Windows 11 and borderless access; the result is read back, never assumed.
-        _borderPropertyPresent = ApiInformation.IsPropertyPresent(SessionClass, "IsBorderRequired");
-        if (_borderPropertyPresent)
-        {
-            if (!_borderlessAccess.Allowed)
-            {
-                Log.Decision($"Borderless access is \"{_borderlessAccess.Text}\"; setting IsBorderRequired = false anyway to see what Windows does.");
-            }
-
-            try
-            {
-                session.IsBorderRequired = false;
-                _borderRequiredAfterSet = session.IsBorderRequired;
-                Log.Api("GraphicsCaptureSession.IsBorderRequired = false", _borderRequiredAfterSet == false, $"reads back {_borderRequiredAfterSet}");
-            }
-            catch (Exception ex)
-            {
-                _borderSetError = $"{ex.GetType().Name}: {ex.Message} (HRESULT 0x{ex.HResult:X8})";
-                Log.Error("Setting GraphicsCaptureSession.IsBorderRequired = false failed", ex);
-            }
-        }
-        else
-        {
-            Log.Warn("GraphicsCaptureSession.IsBorderRequired is not available on this Windows build; the border stays on.");
-        }
-
-        try
-        {
-            session.IsCursorCaptureEnabled = true;
-            Log.Api("GraphicsCaptureSession.IsCursorCaptureEnabled = true", true, $"reads back {session.IsCursorCaptureEnabled}");
-        }
-        catch (Exception ex)
-        {
-            Log.Error("Setting GraphicsCaptureSession.IsCursorCaptureEnabled failed", ex);
-        }
-
-        // Windows 11 24H2 and later can cap the frame rate inside the capture itself, which keeps the load low.
-        if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 26100) && ApiInformation.IsPropertyPresent(SessionClass, "MinUpdateInterval"))
-        {
-            try
-            {
-                session.MinUpdateInterval = TimeSpan.FromTicks(TimeSpan.TicksPerSecond / 15);
-                _frameRateCap = $"MinUpdateInterval = {session.MinUpdateInterval.TotalMilliseconds:0.0} ms (at most 15 frames per second)";
-                Log.Api("GraphicsCaptureSession.MinUpdateInterval = 1/15 s", true, _frameRateCap);
-            }
-            catch (Exception ex)
-            {
-                _frameRateCap = $"setting MinUpdateInterval failed: {ex.Message}";
-                Log.Error("Setting GraphicsCaptureSession.MinUpdateInterval failed", ex);
-            }
-        }
-        else
-        {
-            _frameRateCap = "not available (MinUpdateInterval needs Windows 11 24H2); frames come whenever the screen changes";
-            Log.Decision($"Frame rate cap {_frameRateCap}.");
-        }
+        CaptureSessionSetup.Result result = CaptureSessionSetup.Configure(session, 15, _borderlessAccess.Text);
+        _borderPropertyPresent = result.BorderPropertyPresent;
+        _borderRequiredAfterSet = result.BorderRequiredAfterSet;
+        _borderSetError = result.BorderError;
+        _frameRateCap = result.FrameRateCap;
     }
 
     private async Task RunTimelineAsync(MonitorInfo monitor)
@@ -990,5 +912,4 @@ internal sealed class CaptureTest
         null => "not asked",
     };
 
-    private sealed record AccessResult(bool Allowed, string Text);
 }

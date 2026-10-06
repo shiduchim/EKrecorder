@@ -1,9 +1,8 @@
-EKrecorder - capture test (Step 1 spike)
-=========================================
+EKrecorder - test build (Step 2: the recording engine)
+======================================================
 
-This is an engineering test build, not the finished recorder. It records nothing to video.
-It checks that EKrecorder can capture a whole monitor without the yellow border, and that the
-blue corner triangle and the Identify numbers stay OUT of the captured picture.
+This build records one whole monitor to an MP4 file (video only, no sound yet).
+Default: at most 1920x1080, 15 frames per second, H.264, about 2 Mbps.
 
 1. Double-click EKrecorder.exe.
    If Windows says "Windows protected your PC": click "More info", then "Run anyway".
@@ -12,17 +11,16 @@ blue corner triangle and the Identify numbers stay OUT of the captured picture.
 2. Pick Monitor 1 or Monitor 2. EKrecorder numbers monitors from left to right.
    Not sure which is which? Click "Identify": each screen shows its number for 3 seconds.
 
-3. Click "Run 10-second test" and watch the chosen monitor:
-   - After 1 second a tiny blue triangle appears in its bottom-right corner.
-   - Next to it, a small square blinks pink and green. That is a test marker that is
-     deliberately NOT hidden from the capture, so the test can prove it sees that corner.
-   - From 4.5 to 6.5 seconds every monitor shows its big blue number.
-   - Check whether a yellow border appears around the monitor.
+3. Click "Start recording". The small blue triangle appears in the bottom-right corner
+   of that monitor while it records. It is not in the video.
 
-4. Answer the two Yes/No questions.
+4. Use the PC normally for 1 to 2 minutes, then click "Stop recording".
 
-5. A folder opens on your Desktop under "EKrecorder test results". Open report.txt.
-   The first lines say PASS or FAIL. Paste report.txt into our chat.
-   The corner-*.png pictures show the bottom-right corner of the captured frames, 8 times
-   larger: the blue triangle must NOT be in them. Compare them with
-   corner-REFERENCE-if-the-triangle-were-captured-x8.png, which shows what a failure looks like.
+5. The finished video is saved in Desktop > EKrecordings.
+   A report opens in Notepad. Copy its SUMMARY part and paste it into our chat.
+   "Open last report" opens it again later. "Open recordings" opens the video folder.
+
+While recording, the file is kept in %LocalAppData%\EKrecorder\InProgress and moved to
+Desktop\EKrecordings when you stop. Closing the window also stops and saves the recording.
+
+"Capture test" still runs the Step 1 test (triangle and Identify numbers hidden from capture).
