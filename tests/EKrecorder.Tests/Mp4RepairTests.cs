@@ -391,3 +391,67 @@ public sealed class Mp4RepairTests : IDisposable
     {
     }
 }
+
+public sealed class LongRecordingIndexTests
+{
+    [Fact]
+    public void FilesPast4GBAndHoursOfSamplesGetLargeFieldsWhereNeeded()
+    {
+        // 12 hours of 30 fps video at 10,000,000 ticks per second: the media duration does not fit 32 bits, and the
+        // chunks lie past 4 GB.
+        var header = new TrackHeader
+        {
+            Id = 1,
+            Timescale = 10_000_000,
+            Handler = "vide",
+            Tkhd = Box("tkhd", version: 0, new byte[80]),
+            Mdhd = Box("mdhd", version: 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0x98, 0x96, 0x80, 0, 0, 0, 0, 0x55, 0xC4, 0, 0]),
+            Hdlr = Box("hdlr", version: 0, [0, 0, 0, 0, (byte)'v', (byte)'i', (byte)'d', (byte)'e', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Stsd = Box("stsd", version: 0, [0, 0, 0, 0]),
+        };
+        var track = new TrackSamples(header);
+        const int frames = 12 * 3600 * 30;
+        long offset = 6L * 1024 * 1024 * 1024;
+        for (int i = 0; i < frames; i++)
+        {
+            track.Sizes.Add(1000);
+            track.Durations.Add(333_333 + (uint)(i % 3 == 0 ? 1 : 0));
+            track.CompositionOffsets.Add(0);
+            track.Sync.Add(i % 60 == 0);
+            track.Chunks.Add(new Chunk(offset, i, 1));
+            track.DecodeTime += track.Durations[^1];
+            offset += 1000;
+        }
+
+        track.AnyNonSync = true;
+        var movie = new MovieHeader { Mvhd = Box("mvhd", version: 1, new byte[108]), Timescale = 1000 };
+        movie.Tracks.Add(header);
+
+        byte[] moov = MoovBuilder.Build(movie, [track]);
+
+        var root = new Box("moov", 0, moov.Length, 8);
+        Box trak = BoxIo.Child(moov, root, "trak")!.Value;
+        Box mdia = BoxIo.Child(moov, trak, "mdia")!.Value;
+        Box mdhd = BoxIo.Child(moov, mdia, "mdhd")!.Value;
+        Assert.Equal(1, moov[mdhd.PayloadPosition]);
+        Assert.Equal((ulong)track.MediaDuration, BoxIo.U64(moov, mdhd.PayloadPosition + 24));
+        Box stbl = BoxIo.Child(moov, BoxIo.Child(moov, mdia, "minf")!.Value, "stbl")!.Value;
+        Assert.NotNull(BoxIo.Child(moov, stbl, "co64"));
+        Assert.Null(BoxIo.Child(moov, stbl, "stco"));
+        Box stts = BoxIo.Child(moov, stbl, "stts")!.Value;
+        Assert.True(BoxIo.U32(moov, stts.PayloadPosition + 4) > 1000);
+        Box mvhd = BoxIo.Child(moov, root, "mvhd")!.Value;
+        ulong expectedMovie = (ulong)Math.Round((decimal)track.MediaDuration * 1000 / 10_000_000, MidpointRounding.AwayFromZero);
+        Assert.Equal(expectedMovie, moov[mvhd.PayloadPosition] == 1 ? BoxIo.U64(moov, mvhd.PayloadPosition + 24) : BoxIo.U32(moov, mvhd.PayloadPosition + 16));
+    }
+
+    private static byte[] Box(string type, byte version, byte[] body)
+    {
+        var box = new byte[12 + body.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(box, (uint)box.Length);
+        System.Text.Encoding.ASCII.GetBytes(type).CopyTo(box, 4);
+        box[8] = version;
+        body.CopyTo(box, 12);
+        return box;
+    }
+}
