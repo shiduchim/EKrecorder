@@ -207,6 +207,9 @@ internal sealed class TrayApplication : ApplicationContext
     /// <summary>Saves and applies the Settings window's choices. Returns what went wrong, or null.</summary>
     private string? ApplySettings(AppSettings updated)
     {
+        // The window started from the settings of when it opened; what changed since without it (the last
+        // recording) is kept.
+        updated = updated with { LastRecording = _settings.LastRecording };
         if (updated.Hotkey != _hotkeys.Current)
         {
             Hotkey previous = _hotkeys.Current;
