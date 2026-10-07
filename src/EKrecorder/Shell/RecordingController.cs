@@ -73,7 +73,8 @@ internal sealed class RecordingController : IDisposable
     private DiskState _disk;
     private int _failuresInARow;
     private DateTime _lastFailure;
-    private bool _avoidFragmented;
+    private int _fragmentedEarlyFailures;
+    private bool _avoidFragmentedOnce;
     private bool _stopping;
 
     public RecordingController(AppPaths paths, Func<AppSettings> settings)
@@ -166,7 +167,9 @@ internal sealed class RecordingController : IDisposable
             var audio = new AudioSelection(settings.MicrophoneId, settings.MicrophoneName, settings.OutputId, settings.OutputName);
             bool simulate = SimulateSetupFailure;
             SimulateSetupFailure = false;
-            RecordingSession session = await RecordingSession.StartAsync(monitor, preset, temporary, borderless.Text, audio, simulate, allowFragmented: !_avoidFragmented);
+            bool allowFragmented = !_avoidFragmentedOnce && _fragmentedEarlyFailures < 2;
+            _avoidFragmentedOnce = false;
+            RecordingSession session = await RecordingSession.StartAsync(monitor, preset, temporary, borderless.Text, audio, simulate, allowFragmented: allowFragmented);
 
             _session = session;
             _lastSessionMonitor = session.CurrentMonitor;
@@ -458,9 +461,13 @@ internal sealed class RecordingController : IDisposable
         _lastFailure = now;
         if (failed.IsFragmented && failed.Elapsed < TimeSpan.FromSeconds(30))
         {
-            // The crash-safe file format may be what failed so early; the next recordings use a regular MP4.
-            _avoidFragmented = true;
-            Log.Decision("The next recordings use a regular MP4: a fragmented one failed early.");
+            // The crash-safe file format may be what failed so early: the recording started now is a regular MP4.
+            // The next one started by the user is crash-safe again, unless this happened twice already.
+            _fragmentedEarlyFailures++;
+            _avoidFragmentedOnce = true;
+            Log.Decision(_fragmentedEarlyFailures >= 2
+                ? "A fragmented recording failed early again; recordings use a regular MP4 until EKrecorder restarts."
+                : "A fragmented recording failed early; the restarted recording uses a regular MP4.");
         }
 
         if (_failuresInARow > MaxFailuresInARow)

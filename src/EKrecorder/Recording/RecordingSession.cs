@@ -348,21 +348,35 @@ internal sealed unsafe class RecordingSession
     private Route OpenRoute(CaptureDevice device, ID3D11Device* d3dDevice, out long firstFrameWritten)
     {
         var setups = new List<(string Name, Func<bool, Route?> Open)>();
-        if (device.HasVideoSupport)
+        if (HardwareEncoders.Count == 0)
         {
-            setups.Add((GpuSetup, fragmented => TryOpenGpuRoute(device, d3dDevice, fragmented)));
+            Fallback(GpuSetup, "Windows lists no hardware H.264 encoder on this PC");
+            Fallback(CpuHardwareSetup, "Windows lists no hardware H.264 encoder on this PC");
         }
         else
         {
-            Fallback(GpuSetup, "this GPU device has no Direct3D 11 video support");
+            if (device.HasVideoSupport)
+            {
+                setups.Add((GpuSetup, fragmented => TryOpenGpuRoute(device, d3dDevice, fragmented)));
+            }
+            else
+            {
+                Fallback(GpuSetup, "this GPU device has no Direct3D 11 video support");
+            }
+
+            setups.Add((CpuHardwareSetup, fragmented => OpenCpuRoute(device, d3dDevice, hardware: true, fragmented)));
         }
 
-        setups.Add((CpuHardwareSetup, fragmented => OpenCpuRoute(device, d3dDevice, hardware: true, fragmented)));
         setups.Add((CpuSoftwareSetup, fragmented => OpenCpuRoute(device, d3dDevice, hardware: false, fragmented)));
 
         // Each set-up first with the crash-safe fragmented MP4, then with a regular MP4: the way frames reach the
         // encoder matters more than the container.
         bool[] containers = _allowFragmented ? [true, false] : [false];
+        if (!_allowFragmented)
+        {
+            Fallback("Crash-safe (fragmented) MP4", "a recording in that format failed early just before; this one is a regular MP4");
+        }
+
         var attempts = setups.SelectMany(setup => containers.Select(fragmented =>
             (Name: fragmented ? setup.Name : $"{setup.Name} (regular MP4)", Open: (Func<Route?>)(() => setup.Open(fragmented))))).ToList();
         bool simulate = _simulateFirstSetupFailure;
@@ -530,7 +544,7 @@ internal sealed unsafe class RecordingSession
                 return null;
             }
 
-            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter, withAudio: Audio is not null, fragmented);
+            writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, manager, gpuInput: true, hardwareAllowed: true, device.Adapter, withAudio: Audio is not null, fragmented, requireHardware: true);
             if (!writer.Encoder.IsHardware)
             {
                 Fallback(GpuSetup, "no hardware encoder accepted the settings (GPU frames are only used with a hardware encoder)");
@@ -571,7 +585,7 @@ internal sealed unsafe class RecordingSession
         try
         {
             // No device manager: a hardware encoder then takes frames from memory and runs on its own GPU device.
-            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter, withAudio: Audio is not null, fragmented);
+            H264Mp4Writer writer = H264Mp4Writer.Create(TemporaryPath, OutputSize, Preset, null, gpuInput: false, hardwareAllowed: hardware, device.Adapter, withAudio: Audio is not null, fragmented, requireHardware: hardware);
             var route = new Route(hardware ? CpuHardwareSetup : CpuSoftwareSetup, writer, null, null, cpu, null);
             cpu = null;
             return route;

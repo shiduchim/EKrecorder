@@ -76,6 +76,9 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
 
     public string AudioFormat { get; }
 
+    /// <summary>The AAC bitrate every Windows encoder accepts (the fallback when a higher one is refused).</summary>
+    private const int SafeAudioBitrate = 128_000;
+
     public static string AudioFormatFor(int bitrate) => $"AAC-LC, 48000 Hz, stereo, {bitrate / 1000} kbps";
 
     public EncoderInfo Encoder { get; private set; } = new(false, "unknown", "unknown", "", "", "", "", "", "", "");
@@ -131,16 +134,26 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
     /// <paramref name="withAudio"/>: add the AAC track (dropped, with <see cref="AudioError"/>, if it cannot be set up).
     /// <paramref name="fragmented"/>: write a fragmented (crash-safe) MP4.
     /// <paramref name="forceBFrames"/> (tests only): ask for exactly this many B-frames.
+    /// <paramref name="requireHardware"/>: settings for which Windows falls back to the software encoder count as
+    /// refused, and the next settings are tried with the hardware encoder.
     /// </summary>
     public static H264Mp4Writer Create(
         string path, Size size, RecordingPreset preset, IMFDXGIDeviceManager* manager, bool gpuInput, bool hardwareAllowed, AdapterInfo adapter, bool withAudio,
-        bool fragmented = false, int? forceBFrames = null)
+        bool fragmented = false, int? forceBFrames = null, bool requireHardware = false)
     {
         var failures = new List<string>();
         string? audioError = null;
         foreach (Plan plan in Plans(preset, forceBFrames))
         {
             H264Mp4Writer? writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, withAudio, fragmented, out string failure, out bool audioFailed);
+            if (writer is null && withAudio && audioFailed && preset.AudioBitrate != SafeAudioBitrate)
+            {
+                // Every Windows AAC encoder takes 128 kbps; a higher rate this one refuses is not worth losing the sound.
+                Log.Warn($"The AAC encoder refused {preset.AudioBitrate / 1000} kbps ({failure}); using {SafeAudioBitrate / 1000} kbps.");
+                preset = preset with { AudioBitrate = SafeAudioBitrate };
+                writer = TryCreate(path, size, preset, manager, gpuInput, hardwareAllowed, plan, withAudio, fragmented, out failure, out audioFailed);
+            }
+
             if (writer is null && withAudio && audioFailed)
             {
                 // The video side was fine; record without audio rather than not at all, and say so loudly.
@@ -154,6 +167,21 @@ internal sealed unsafe class H264Mp4Writer : IDisposable
             {
                 writer.AudioError = audioError;
                 writer.Identify(plan, preset, adapter);
+                if (requireHardware && !writer.Encoder.IsHardware)
+                {
+                    // Windows loaded the software encoder because the hardware one refused these settings.
+                    Log.Warn($"{plan.Name}: Windows chose the software encoder (the hardware encoder refused these settings); trying the next settings.");
+                    writer.Dispose();
+                    failures.Add($"{plan.Name}: the hardware encoder refused these settings");
+                    continue;
+                }
+
+                if (plan.BFrames is { } wanted && writer.Encoder.BFrames != "not reported"
+                    && writer.Encoder.BFrames != wanted.ToString(CultureInfo.InvariantCulture))
+                {
+                    Log.Warn($"The encoder reports {writer.Encoder.BFrames} B-frames although {wanted} were asked for; the file's timeline is corrected for them.");
+                }
+
                 writer.ReadEncoderInput();
                 return writer;
             }
