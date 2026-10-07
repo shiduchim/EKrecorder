@@ -26,6 +26,10 @@ If the PC crashes or the power goes
   - The recording is written in a crash-safe way. At the next start EKrecorder
     finishes it and puts it in your recordings folder with "(recovered)" in the
     name. You lose only the last second or two.
+  - Shutting down, restarting or putting the PC to sleep while recording is
+    fine: the recording is stopped and saved (after waking up, if needed).
+  - EKrecorder never deletes a recording. One it cannot save is kept in
+    %LocalAppData%\EKrecorder\InProgress\Unrecoverable.
 
 Settings (double-click the EKrecorder icon)
   - Monitor, video quality (480p to 4K, 30 fps), recordings folder

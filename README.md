@@ -32,16 +32,20 @@ microphone and computer audio (Windows defaults or a specific device), audio qua
   `%LocalAppData%\EKrecorder\InProgress` (never straight into the Desktop or a synced folder). After stopping it is
   turned into a regular MP4 in place (no copying, no re-encoding), checked, and only then moved to the recordings
   folder. If the PC crashes, the power fails or EKrecorder is killed, the next start recovers the recording up to its
-  last second or two.
+  last second or two. Every step can be interrupted and repeated: the new index is written and flushed before it is
+  marked as the index, nothing is ever cut off or deleted (unusable bytes become padding), and damage in the middle
+  of a file is stepped over instead of ending the recording there.
 - **Audio that survives device changes.** Microphone and computer audio are captured with WASAPI; a device that
   disappears is filled with silence and reconnected automatically, a chosen device falls back to the Windows default
   and returns when it is back, and the timeline follows one clock so sound stays in sync for hours.
 - **The monitor can come and go.** If the recorded monitor disconnects or sleeps, recording continues (the picture
-  holds) and the same physical monitor is picked up again when it returns.
+  holds) and the same physical monitor is picked up again when it returns: found the same way twice in a row, and
+  counted as back only when its first picture arrives. After any display change the recording checks that it still
+  captures that monitor.
 - **Disk space.** The triangle turns orange when space runs low; the recording is stopped and saved while there is
   still room.
 - **Windows events.** No automatic sleep while recording; a recording is stopped and saved when Windows shuts down,
-  logs off or goes to sleep.
+  logs off or goes to sleep, and Exit (or an update) waits until the recording is saved.
 
 Logs: `%LocalAppData%\EKrecorder\Logs` (size-limited). A technical report for every recording:
 `%LocalAppData%\EKrecorder\Reports`. Nothing opens by itself.
