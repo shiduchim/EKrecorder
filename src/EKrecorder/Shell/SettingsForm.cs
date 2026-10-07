@@ -282,6 +282,41 @@ internal sealed class SettingsForm : Form
         static string NameOf(Control c) => c.AccessibleName ?? (c.Text.Length > 0 ? c.Text : c.GetType().Name);
     }
 
+    /// <summary>
+    /// Self-test only, for a window opened as the tray opens it: it lies on its screen (a short screen scrolls the
+    /// page), and the fonts WinForms could rescale are at the window's scale.
+    /// </summary>
+    public IReadOnlyList<string> CheckPlacement()
+    {
+        var problems = new List<string>();
+        Rectangle area = Screen.FromControl(this).WorkingArea;
+        if (!area.Contains(Bounds))
+        {
+            problems.Add($"the window {Bounds} is not inside the screen's working area {area}");
+        }
+
+        if (_content.Height > ClientSize.Height && !VerticalScroll.Visible)
+        {
+            problems.Add($"the page ({_content.Height} px) is taller than the window ({ClientSize.Height} px) but does not scroll");
+        }
+
+        if (HorizontalScroll.Visible)
+        {
+            problems.Add("the window scrolls sideways");
+        }
+
+        float expected = 14 * DeviceDpi / 96f;
+        foreach (Control control in new Control[] { _recordingHeading, _shortcut, _microphone })
+        {
+            if (Math.Abs(control.Font.Size - expected) > 0.5f)
+            {
+                problems.Add(string.Create(CultureInfo.InvariantCulture, $"{control.AccessibleName ?? control.Text}: font {control.Font.Size:0.#} px, expected {expected:0.#} px"));
+            }
+        }
+
+        return problems;
+    }
+
     /// <summary>Shows or hides "Recording now · Changes apply to the next recording".</summary>
     public void SetRecording(bool recording)
     {
@@ -336,6 +371,39 @@ internal sealed class SettingsForm : Form
         }
     }
 
+    protected override void OnLoad(EventArgs e)
+    {
+        // Every control has its window now. Fonts and sizes once more at this monitor's scale: WinForms rescales a font
+        // that was set before a control's window existed when that window opens at another DPI (a heading at half or
+        // double size), and only now can the window's height be fitted to the screen.
+        float scale = _forcedScale ?? DeviceDpi / 96f;
+        if (Math.Abs(scale - _scale) > 0.001f)
+        {
+            SetScale(scale);
+        }
+        else
+        {
+            ApplyTheme();
+        }
+
+        float before = _scale;
+        base.OnLoad(e); // centres the window on the monitor under the pointer
+        if (Math.Abs(_scale - before) > 0.001f)
+        {
+            // That monitor has another scale, so the window was laid out again at another size: centred again.
+            CenterToScreen();
+        }
+    }
+
+    protected override bool OnGetDpiScaledSize(int deviceDpiOld, int deviceDpiNew, ref Size desiredSize)
+    {
+        // Windows scales the window by the DPI ratio, which is what the layout makes of it within a pixel or two
+        // (WinForms' own answer, without automatic scaling, would keep the old size, and the window would then
+        // jump in size around its corner and could flip between the two monitors' scales while being dragged).
+        base.OnGetDpiScaledSize(deviceDpiOld, deviceDpiNew, ref desiredSize);
+        return false;
+    }
+
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
@@ -356,8 +424,12 @@ internal sealed class SettingsForm : Form
     {
         base.OnActivated(e);
 
-        // Whatever stopped the meters while the window stayed open (a cancelled shutdown), they come back.
-        StartPreview();
+        // Whatever stopped the meters while the window stayed open (a cancelled shutdown), they come back (after the
+        // window is painted, as when it opens).
+        if (!_meterTimer.Enabled && IsHandleCreated && !_closed)
+        {
+            BeginInvoke(StartPreview);
+        }
     }
 
     protected override void OnResize(EventArgs e)
@@ -623,6 +695,7 @@ internal sealed class SettingsForm : Form
         _maxTime.Width = controlWidth;
         y = PlaceSimpleCard(_stopCard, _maxTime, pad, y, cardWidth, right) + gap;
         y = PlaceSimpleCard(_startupCard, _startWithWindows, pad, y, cardWidth, right);
+        _startWithWindows.Left += _startWithWindows.RingRoom; // the switch lines up with the lists; its focus ring may reach past them
 
         // Footer: a line, then Save and Cancel on the right.
         y += D(24);
@@ -637,7 +710,7 @@ internal sealed class SettingsForm : Form
         _footer.Invalidate();
         y = _footer.Bottom;
 
-        _content.Bounds = new Rectangle(0, 0, width, y);
+        _content.Bounds = new Rectangle(AutoScrollPosition.X, AutoScrollPosition.Y, width, y); // where the page is scrolled to
         Size client = new(width, y);
         if (_forcedScale is null && IsHandleCreated)
         {
@@ -701,7 +774,7 @@ internal sealed class SettingsForm : Form
         int line = header - D(4);
         int meterWidth = D(140);
         meter.Bounds = new Rectangle(card.TextLeft, line + ((status.Height - D(10)) / 2), meterWidth, D(10));
-        status.Location = new Point(meter.Visible ? meter.Right + D(12) : card.TextLeft, line);
+        status.Location = new Point(meter.Shown ? meter.Right + D(12) : card.TextLeft, line);
         status.Width = right - status.Left;
         card.Bounds = new Rectangle(pad, y, cardWidth, line + status.Height + D(14));
         return card.Bottom;
@@ -988,9 +1061,9 @@ internal sealed class SettingsForm : Form
     /// <summary>The meter and status of one input; without a working device the status takes the whole line.</summary>
     private void ShowInput(Card card, LevelMeter meter, StatusLine status, AudioInputStatus input, bool showMeter, string text, Color? color, string glyph, string link)
     {
-        if (meter.Visible != showMeter)
+        if (meter.Shown != showMeter)
         {
-            meter.Visible = showMeter;
+            meter.Shown = showMeter;
             status.Left = showMeter ? meter.Right + D(12) : card.TextLeft;
             status.Width = card.Width - D(16) - status.Left;
         }

@@ -351,6 +351,15 @@ internal sealed class SelfTest : ApplicationContext
         IReadOnlyList<string> recording = form.CheckLayout();
         Result("Settings window laid out while recording (at 225 %)", recording.Count == 0, recording.Count == 0 ? "nothing cut off or overlapping" : string.Join("; ", recording));
         form.Close();
+
+        // As the tray opens it: centred, at the screen's own scale, fitted to the screen (this one is short: it scrolls).
+        using var opened = new SettingsForm(settings, monitors, hotkeys, _ => null, _ => { });
+        opened.Show();
+        await Task.Delay(500);
+        IReadOnlyList<string> placement = opened.CheckPlacement();
+        Result("Settings window opened as the tray opens it: on the screen, fonts at its scale", placement.Count == 0,
+            placement.Count == 0 ? Invariant($"{opened.Bounds} on {Screen.FromControl(opened).WorkingArea}") : string.Join("; ", placement));
+        opened.Close();
     }
 
     private void Result(string name, bool passed, string detail)

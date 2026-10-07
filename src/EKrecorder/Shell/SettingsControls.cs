@@ -505,12 +505,29 @@ internal sealed class LevelMeter : Control, IThemed
     private TimeSpan _peakAt;
     private TimeSpan _last;
     private bool _active;
+    private bool _shown = true;
 
     public LevelMeter()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         TabStop = false;
         AccessibleRole = AccessibleRole.ProgressBar;
+    }
+
+    /// <summary>
+    /// Whether the meter is meant to be on the card. <see cref="Control.Visible"/> also says false while the window
+    /// itself is hidden, so the layout asks this instead.
+    /// </summary>
+    [Browsable(false)]
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool Shown
+    {
+        get => _shown;
+        set
+        {
+            _shown = value;
+            Visible = value;
+        }
     }
 
     /// <summary>False while no device is captured (the bar is empty).</summary>
@@ -710,6 +727,7 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
 {
     private const int WmPaint = 0x000F;
     private const int WmPrintClient = 0x0318;
+    private const int WmMouseWheel = 0x020A;
     private UiTheme? _theme;
     private UiFonts? _fonts;
     private float _scale = 1;
@@ -751,6 +769,18 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
 
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == WmMouseWheel && !DroppedDown)
+        {
+            // Scrolling past a closed list must not switch the microphone: the page scrolls instead.
+            if (FindForm() is { IsHandleCreated: true } form)
+            {
+                SendMessage(form.Handle, WmMouseWheel, m.WParam, m.LParam);
+            }
+
+            m.Result = IntPtr.Zero;
+            return;
+        }
+
         if (_theme is not null && IsHandleCreated)
         {
             // The closed list is drawn entirely here (the native one would add its own frame and arrow).
@@ -836,18 +866,6 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
         Invalidate();
     }
 
-    protected override void OnMouseWheel(MouseEventArgs e)
-    {
-        if (!DroppedDown && e is HandledMouseEventArgs handled)
-        {
-            // Scrolling past the list must not switch the microphone.
-            handled.Handled = true;
-            return;
-        }
-
-        base.OnMouseWheel(e);
-    }
-
     protected override void OnDrawItem(DrawItemEventArgs e)
     {
         if (_theme is null || _fonts is null || e.Index < 0)
@@ -919,6 +937,9 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
 
     [DllImport("user32.dll")]
     private static extern IntPtr BeginPaint(IntPtr window, out PaintStruct paint);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -1062,9 +1083,12 @@ internal sealed class ToggleSwitch : Control, IThemed
         _fonts = fonts;
         _scale = scale;
         BackColor = theme.Card;
-        Size = new Size(TextRenderer.MeasureText("Off", fonts.Body).Width + D(12) + D(44), Math.Max(D(28), fonts.Body.Height));
+        Size = new Size(TextRenderer.MeasureText("Off", fonts.Body).Width + D(12) + D(44) + RingRoom, Math.Max(D(32), fonts.Body.Height));
         Invalidate();
     }
+
+    /// <summary>Room right of the switch for its keyboard focus ring (the layout lets it reach past the column's edge).</summary>
+    public int RingRoom => D(4);
 
     protected override void OnClick(EventArgs e)
     {
@@ -1118,7 +1142,7 @@ internal sealed class ToggleSwitch : Control, IThemed
         }
 
         Graphics g = e.Graphics;
-        var track = new RectangleF(Width - D(42) + 0.5f, ((Height - D(20)) / 2f) + 0.5f, D(40) - 1, D(20) - 1);
+        var track = new RectangleF(Width - RingRoom - D(42) + 0.5f, ((Height - D(20)) / 2f) + 0.5f, D(40) - 1, D(20) - 1);
         TextRenderer.DrawText(g, _checked ? "On" : "Off", _fonts.Body, new Rectangle(0, 0, (int)track.Left - D(12), Height), _theme.Text, _theme.Card,
             TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
         g.SmoothingMode = SmoothingMode.AntiAlias;
