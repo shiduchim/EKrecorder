@@ -252,6 +252,7 @@ internal static class Glyphs
     public const string Warning = "\uE7BA";
     public const string CheckMark = "\uE73E";
     public const string MicrophoneOff = "\uEC54";
+    public const string ChevronDown = "\uE70D";
 
     private static readonly Dictionary<int, Font> Fonts = new();
     private static string? _family;
@@ -272,10 +273,13 @@ internal static class Glyphs
         }
     }
 
-    /// <summary>Draws <paramref name="glyph"/> centred in <paramref name="box"/>, <paramref name="pixels"/> high.</summary>
+    /// <summary>
+    /// Draws <paramref name="glyph"/> centred in <paramref name="box"/>, <paramref name="pixels"/> high, with grey
+    /// anti-aliasing as Windows draws its own icons (ClearType gives thin icons coloured fringes).
+    /// </summary>
     public static void Draw(Graphics g, string glyph, Rectangle box, Color color, float pixels, Color? back = null)
     {
-        if (Family is not { } family)
+        if (Family is not { } family || glyph.Length == 0)
         {
             return;
         }
@@ -287,15 +291,22 @@ internal static class Glyphs
             Fonts[key] = font;
         }
 
-        TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
-        if (back is { } background)
+        GraphicsState state = g.Save();
+        try
         {
-            // With the background colour ClearType edges blend into it instead of turning dark.
-            TextRenderer.DrawText(g, glyph, font, box, color, background, flags);
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            using var brush = new SolidBrush(color);
+            using var format = new StringFormat(StringFormat.GenericTypographic)
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center,
+                FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip,
+            };
+            g.DrawString(glyph, font, brush, box, format);
         }
-        else
+        finally
         {
-            TextRenderer.DrawText(g, glyph, font, box, color, flags);
+            g.Restore(state);
         }
     }
 

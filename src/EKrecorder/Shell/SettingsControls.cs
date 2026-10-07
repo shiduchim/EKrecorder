@@ -701,11 +701,14 @@ internal sealed class StatusLine : Control, IThemed
 }
 
 /// <summary>
-/// A drop-down list in the window's own colours (also in dark mode), with long names shortened by "…" and shown
-/// whole in the open list. Turning the mouse wheel over it while it is closed does not change the choice.
+/// A drop-down list in the window's own colours (also in dark mode): a rounded frame, a chevron, long names shortened
+/// by "…" and shown whole in the open list, and an accent line while it has the focus. Turning the mouse wheel over
+/// it while it is closed does not change the choice.
 /// </summary>
 internal sealed class ThemedComboBox : ComboBox, IThemed
 {
+    private const int WmPaint = 0x000F;
+    private const int WmPrintClient = 0x0318;
     private UiTheme? _theme;
     private UiFonts? _fonts;
     private float _scale = 1;
@@ -744,6 +747,38 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
         DropDownWidth = Math.Clamp(widest + scrollbar + (int)Math.Round(16 * _scale), Width, Math.Max(Width, limit));
     }
 
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (_theme is null || !IsHandleCreated)
+        {
+            return;
+        }
+
+        if (m.Msg == WmPaint)
+        {
+            using Graphics g = Graphics.FromHwnd(Handle);
+            PaintFrame(g);
+        }
+        else if (m.Msg == WmPrintClient && m.WParam != IntPtr.Zero)
+        {
+            using Graphics g = Graphics.FromHdc(m.WParam);
+            PaintFrame(g);
+        }
+    }
+
+    protected override void OnGotFocus(EventArgs e)
+    {
+        base.OnGotFocus(e);
+        Invalidate();
+    }
+
+    protected override void OnLostFocus(EventArgs e)
+    {
+        base.OnLostFocus(e);
+        Invalidate();
+    }
+
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         if (!DroppedDown && e is HandledMouseEventArgs handled)
@@ -772,10 +807,57 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
             e.Graphics.FillRectangle(brush, e.Bounds);
         }
 
-        Rectangle text = Rectangle.Inflate(e.Bounds, -(int)Math.Round(6 * _scale), 0);
+        Rectangle text = Rectangle.Inflate(e.Bounds, -D(6), 0);
+        if (edit)
+        {
+            // Not under the chevron drawn over the native button.
+            text.Width = Math.Max(0, Math.Min(text.Width, Width - ButtonWidth() - D(4) - text.Left));
+        }
+
         TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), _fonts.Body, text, Enabled ? _theme.Text : _theme.DisabledText, back,
             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
     }
+
+    private int ButtonWidth() => D(32);
+
+    /// <summary>Over the native frame and button: a rounded frame, the chevron, and the focus line.</summary>
+    private void PaintFrame(Graphics g)
+    {
+        UiTheme theme = _theme!;
+        Rectangle r = ClientRectangle;
+        int border = Math.Max(1, (int)Math.Round(_scale));
+        int button = ButtonWidth();
+        using (var fill = new SolidBrush(theme.Control))
+        {
+            g.FillRectangle(fill, r.Right - button - border, border, button, r.Height - (2 * border));
+        }
+
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var bounds = new RectangleF(border / 2f, border / 2f, r.Width - border - 0.5f, r.Height - border - 0.5f);
+        using (GraphicsPath shape = Glyphs.Rounded(bounds, D(4)))
+        using (var outside = new Region(new Rectangle(Point.Empty, r.Size)))
+        {
+            outside.Exclude(shape);
+            using (var corners = new SolidBrush(Parent?.BackColor ?? theme.Card))
+            {
+                g.FillRegion(corners, outside);
+            }
+
+            using var pen = new Pen(Enabled ? theme.ControlBorder : theme.DisabledText, border);
+            g.DrawPath(pen, shape);
+        }
+
+        g.SmoothingMode = SmoothingMode.None;
+        Glyphs.Draw(g, Glyphs.ChevronDown, new Rectangle(r.Right - button, 0, button, r.Height), Enabled ? theme.SecondaryText : theme.DisabledText, 12 * _scale);
+        if (Focused || DroppedDown)
+        {
+            int line = Math.Max(2, (int)Math.Round(2 * _scale));
+            using var accent = new SolidBrush(theme.Accent);
+            g.FillRectangle(accent, D(3), r.Height - line - border, r.Width - D(6), line);
+        }
+    }
+
+    private int D(float dip) => (int)Math.Round(dip * _scale);
 }
 
 /// <summary>A Windows 11 text field around a text box: rounded, in the control colour, with an accent line under it while it has the focus.</summary>
@@ -1014,7 +1096,6 @@ internal sealed class PillButton : Control, IButtonControl, IThemed
     private float _scale = 1;
     private bool _hover;
     private bool _pressed;
-    private bool _isDefault;
 
     public PillButton()
     {
@@ -1037,10 +1118,9 @@ internal sealed class PillButton : Control, IButtonControl, IThemed
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public DialogResult DialogResult { get; set; }
 
+    /// <summary>Windows makes the focused button the default one; that is shown by the focus ring alone.</summary>
     public void NotifyDefault(bool value)
     {
-        _isDefault = value;
-        Invalidate();
     }
 
     public void PerformClick()
@@ -1235,7 +1315,7 @@ internal sealed class PillButton : Control, IButtonControl, IThemed
                     g.FillPath(brush, shape);
                     if (!accent)
                     {
-                        using var pen = new Pen(_isDefault && Enabled ? _theme.Accent : _theme.ControlBorder, border);
+                        using var pen = new Pen(_theme.ControlBorder, border);
                         g.DrawPath(pen, shape);
                     }
                 }
