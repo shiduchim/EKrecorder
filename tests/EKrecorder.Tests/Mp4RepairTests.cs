@@ -110,6 +110,7 @@ public sealed class Mp4RepairTests : IDisposable
     [InlineData(3)]
     [InlineData(4)]
     [InlineData(5)]
+    [InlineData(6)]
     public void AConversionInterruptedAtAnyStepFinishesTheSame(int crashBeforeStep)
     {
         // Cut inside the last fragment's media data, so every step has work to do; fragment brands so step 5 does too.
@@ -133,7 +134,201 @@ public sealed class Mp4RepairTests : IDisposable
         RepairResult resumed = Mp4Repair.Run(path);
 
         Assert.True(resumed.Playable, resumed.Detail);
+        if (crashBeforeStep == 4)
+        {
+            // The index was on disk but not yet marked as the index: it is not trusted, a new one is written after it.
+            AssertTracks(path, Expected(written, builder, cut));
+            Assert.True(Mp4File.Summarize(path).Ok);
+            return;
+        }
+
         Assert.Equal(File.ReadAllBytes(reference), File.ReadAllBytes(path));
+    }
+
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(0.5)]
+    [InlineData(0.99)]
+    public void AHalfWrittenIndexIsNeverTrusted(double keptPart)
+    {
+        // A power cut while the index was being written: its start reached the disk, the rest reads as zeros.
+        var builder = new FragmentedMp4Builder();
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(8), written);
+        string path = Save(original);
+        Assert.Throws<SimulatedCrash>(() => Mp4Repair.Run(path, step =>
+        {
+            if (step == 4)
+            {
+                throw new SimulatedCrash();
+            }
+        }));
+        byte[] crashed = File.ReadAllBytes(path);
+        int indexAt = IndexOfLastBox(crashed);
+        int kept = indexAt + 8 + (int)((crashed.Length - indexAt - 8) * keptPart);
+        Array.Clear(crashed, kept, crashed.Length - kept);
+        File.WriteAllBytes(path, crashed);
+
+        RepairResult resumed = Mp4Repair.Run(path);
+
+        Assert.Equal(RepairOutcome.Converted, resumed.Outcome);
+        AssertTracks(path, Expected(written, builder, original.Length));
+        Assert.True(Mp4File.Summarize(path).Ok);
+    }
+
+    [Fact]
+    public void ADamagedIndexIsBuiltAgainFromTheFragments()
+    {
+        // The index was marked as the index, then the disk lost part of it before the fragment headers were touched.
+        var builder = new FragmentedMp4Builder();
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(8), written);
+        string path = Save(original);
+        Assert.Throws<SimulatedCrash>(() => Mp4Repair.Run(path, step =>
+        {
+            if (step == 5)
+            {
+                throw new SimulatedCrash();
+            }
+        }));
+        byte[] crashed = File.ReadAllBytes(path);
+        int indexAt = IndexOfLastBox(crashed);
+        int half = indexAt + ((crashed.Length - indexAt) / 2);
+        Array.Clear(crashed, half, crashed.Length - half);
+        File.WriteAllBytes(path, crashed);
+
+        RepairResult resumed = Mp4Repair.Run(path);
+
+        Assert.Equal(RepairOutcome.Converted, resumed.Outcome);
+        AssertTracks(path, Expected(written, builder, original.Length));
+        AssertNoFragmentBoxes(path);
+    }
+
+    [Fact]
+    public void AWrongMdatSizeInTheMiddleLosesNothing()
+    {
+        var builder = new FragmentedMp4Builder();
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(20), written);
+        byte[] damaged = (byte[])original.Clone();
+        long mdat = builder.Moofs[9].End;
+        damaged[mdat] ^= 0x40; // the size field's top byte: far past the end of the file
+        string path = Save(damaged);
+
+        RepairResult result = Mp4Repair.Run(path);
+
+        Assert.Equal(RepairOutcome.Converted, result.Outcome);
+        AssertTracks(path, Expected(written, builder, original.Length));
+        AssertNoFragmentBoxes(path);
+    }
+
+    [Theory]
+    [InlineData(3)]
+    [InlineData(5000)]
+    public void AnMdatSizeThatSwallowsFragmentsIsCorrected(int extra)
+    {
+        // A size that still fits in the file, but runs into the following fragments.
+        var builder = new FragmentedMp4Builder();
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(20), written);
+        byte[] damaged = (byte[])original.Clone();
+        long mdat = builder.Moofs[9].End;
+        uint size = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(damaged.AsSpan((int)mdat));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(damaged.AsSpan((int)mdat), size + (uint)extra);
+        string path = Save(damaged);
+
+        Assert.Equal(RepairOutcome.Converted, Mp4Repair.Run(path).Outcome);
+        AssertTracks(path, Expected(written, builder, original.Length));
+    }
+
+    [Fact]
+    public void ADamagedFragmentLosesOnlyThatFragment()
+    {
+        var builder = new FragmentedMp4Builder();
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(20), written);
+        byte[] damaged = (byte[])original.Clone();
+        (long start, long end) = builder.Moofs[9];
+        Array.Clear(damaged, (int)start, (int)(end - start)); // the whole fragment header is gone
+        string path = Save(damaged);
+
+        RepairResult result = Mp4Repair.Run(path);
+
+        Assert.Equal(RepairOutcome.Converted, result.Outcome);
+        var expected = new Dictionary<int, List<WrittenSample>>();
+        for (int track = 1; track <= 2; track++)
+        {
+            expected[track] = written.Where(w => w.Track == track && w.Moof != 9).ToList();
+        }
+
+        AssertTracks(path, expected);
+        Assert.True(Mp4File.Summarize(path).Ok);
+        Assert.Contains(result.Notes, n => n.Contains("damaged", StringComparison.Ordinal) || n.Contains("really ends", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ARunWithADamagedSampleCountIsReadFromItsSize()
+    {
+        var builder = new FragmentedMp4Builder();
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(20), written);
+        byte[] damaged = (byte[])original.Clone();
+        int trun = damaged.AsSpan((int)builder.Moofs[9].Start).IndexOf("trun"u8) + (int)builder.Moofs[9].Start;
+        damaged[trun + 4 + 4 + 1] ^= 0x10; // sample_count, second byte
+        string path = Save(damaged);
+
+        Assert.Equal(RepairOutcome.Converted, Mp4Repair.Run(path).Outcome);
+        AssertTracks(path, Expected(written, builder, original.Length));
+    }
+
+    [Fact]
+    public void MissingSamplesInTheMiddleKeepTheTimeline()
+    {
+        // The bytes of fragment 10 are not in any mdat any more (its mdat header was damaged beyond repair), but its
+        // header is fine: the gap is bridged by the sample before it, so everything after keeps its time.
+        var builder = new FragmentedMp4Builder { MediaFoundationPrefix = false };
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(12), written);
+        byte[] damaged = (byte[])original.Clone();
+        long mdat = builder.Moofs[9].End;
+        "free"u8.CopyTo(damaged.AsSpan((int)mdat + 4));
+        string path = Save(damaged);
+
+        Assert.Equal(RepairOutcome.Converted, Mp4Repair.Run(path).Outcome);
+        using FileStream stream = File.OpenRead(path);
+        (List<TrackTable> tracks, _, string? problem) = Mp4File.ReadTracks(stream);
+        Assert.Null(problem);
+        foreach (TrackTable table in tracks)
+        {
+            int trackId = (int)table.Id;
+            List<WrittenSample> all = written.Where(w => w.Track == trackId).ToList();
+            Assert.Equal(all.Count(w => w.Moof != 9), table.Count);
+            Assert.Equal(all.Sum(w => (long)w.Duration), table.MediaDuration);
+        }
+    }
+
+    [Fact]
+    public void ZeroFilledSamplesAtTheEndAreLeftOut()
+    {
+        // The power went off: the file's length reached the disk, the last fragment's data did not.
+        var builder = new FragmentedMp4Builder { Mfra = false };
+        var written = new List<WrittenSample>();
+        byte[] original = builder.Build(FragmentedMp4Builder.TypicalFragments(6), written);
+        byte[] damaged = (byte[])original.Clone();
+        int lastData = (int)builder.Moofs[^1].End + 8;
+        Array.Clear(damaged, lastData, damaged.Length - lastData);
+        string path = Save(damaged);
+
+        RepairResult result = Mp4Repair.Run(path);
+
+        Assert.Equal(RepairOutcome.Converted, result.Outcome);
+        var expected = new Dictionary<int, List<WrittenSample>>();
+        for (int track = 1; track <= 2; track++)
+        {
+            expected[track] = written.Where(w => w.Track == track && w.Moof != builder.Moofs.Count - 1).ToList();
+        }
+
+        AssertTracks(path, expected);
     }
 
     [Theory]
@@ -221,7 +416,18 @@ public sealed class Mp4RepairTests : IDisposable
         TrackTable video = tracks.Single(t => t.Handler == "vide");
         MoovBuilder.Edit edit = Assert.Single(video.Edits);
         Assert.Equal(1000, edit.MediaTime);
-        Assert.Equal((ulong)((video.MediaDuration - 1000) * movieTimescale / video.Timescale), edit.SegmentDuration);
+
+        // Until the last picture has been shown, not just until the last one decoded.
+        long decode = 0;
+        long shownUntil = 0;
+        foreach (WrittenSample sample in written.Where(w => w.Track == 1))
+        {
+            shownUntil = Math.Max(shownUntil, decode + sample.Cto + sample.Duration);
+            decode += sample.Duration;
+        }
+
+        Assert.True(shownUntil > video.MediaDuration);
+        Assert.Equal((ulong)((shownUntil - 1000) * movieTimescale / video.Timescale), edit.SegmentDuration);
         Assert.Empty(tracks.Single(t => t.Handler == "soun").Edits);
     }
 
@@ -298,6 +504,26 @@ public sealed class Mp4RepairTests : IDisposable
 
         Assert.Equal(RepairOutcome.Converted, Mp4Repair.Run(path).Outcome);
         AssertTracks(path, Expected(written, builder, keep));
+    }
+
+    /// <summary>Where the last top-level box starts.</summary>
+    private static int IndexOfLastBox(byte[] file)
+    {
+        int position = 0;
+        int last = 0;
+        while (position + 8 <= file.Length)
+        {
+            uint size = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(file.AsSpan(position));
+            if (size < 8)
+            {
+                break;
+            }
+
+            last = position;
+            position += (int)size;
+        }
+
+        return last;
     }
 
     private string Save(byte[] bytes, string name = "recording.mp4")

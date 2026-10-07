@@ -62,7 +62,7 @@ internal static class MoovBuilder
             long delay = ReorderingDelay(track);
             if (start > 0 || delay > 0)
             {
-                long shown = Math.Max(0, track.MediaDuration - delay);
+                long shown = Math.Max(0, PresentationEnd(track) - delay);
                 edits.Add(new Edit(Rescale((ulong)shown, mediaTimescale, movieTimescale), delay, 0x10000));
             }
 
@@ -114,6 +114,28 @@ internal static class MoovBuilder
         }
 
         return Math.Max(0, earliest);
+    }
+
+    /// <summary>
+    /// When the last picture stops being shown, counted from the first sample's decode time: the media duration,
+    /// or later with reordering (the last pictures decoded are not the last ones shown).
+    /// </summary>
+    internal static long PresentationEnd(TrackSamples track)
+    {
+        if (!track.AnyCompositionOffset)
+        {
+            return track.MediaDuration;
+        }
+
+        long decode = 0;
+        long end = 0;
+        for (int i = 0; i < track.Count; i++)
+        {
+            end = Math.Max(end, decode + track.CompositionOffsets[i] + track.Durations[i]);
+            decode += track.Durations[i];
+        }
+
+        return end;
     }
 
     /// <summary>The entries of an edts box (header included), or none.</summary>

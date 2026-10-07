@@ -75,7 +75,8 @@ internal static class Mp4File
     {
         try
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            // No read buffer: the walk jumps from header to header, and a buffer would read far more than it uses.
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1, FileOptions.None);
             return Summarize(stream);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

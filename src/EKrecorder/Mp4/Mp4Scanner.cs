@@ -85,14 +85,52 @@ internal sealed class TrackSamples
 
     public bool AnyNonSync { get; set; }
 
-    /// <summary>A sample of this track was missing (cut off); nothing after it is used.</summary>
-    public bool Stopped { get; set; }
+    /// <summary>Samples skipped since the last one kept (not in the file, or in a damaged part), and their total duration.</summary>
+    public int MissingSamples { get; set; }
+
+    public long MissingDuration { get; set; }
+
+    /// <summary>Where the first of the skipped samples was supposed to be (for the notes).</summary>
+    public long MissingFrom { get; set; }
 
     public long Bytes { get; set; }
 
     public int Count => Sizes.Count;
 
     public long MediaDuration => DecodeTime - FirstDecodeTime;
+
+    /// <summary>Where the last sample is in the file, and its size.</summary>
+    public (long Offset, uint Size) LastSample()
+    {
+        Chunk chunk = Chunks[^1];
+        long offset = chunk.Offset;
+        for (int i = chunk.FirstSample; i < Count - 1; i++)
+        {
+            offset += Sizes[i];
+        }
+
+        return (offset, Sizes[^1]);
+    }
+
+    public void RemoveLast()
+    {
+        int last = Count - 1;
+        Bytes -= Sizes[last];
+        DecodeTime -= Durations[last];
+        Sizes.RemoveAt(last);
+        Durations.RemoveAt(last);
+        CompositionOffsets.RemoveAt(last);
+        Sync.RemoveAt(last);
+        Chunk chunk = Chunks[^1];
+        if (chunk.Count == 1)
+        {
+            Chunks.RemoveAt(Chunks.Count - 1);
+        }
+        else
+        {
+            Chunks[^1] = chunk with { Count = chunk.Count - 1 };
+        }
+    }
 }
 
 /// <summary>What kind of file a scan found.</summary>
@@ -145,6 +183,13 @@ internal sealed class Mp4Layout
     /// <summary>An mdat whose size field must be rewritten (cut off by a crash, or "to the end of the file").</summary>
     public (Box Mdat, long NewSize)? MdatSizeFix { get; set; }
 
+    /// <summary>
+    /// Boxes whose header the scan worked out around damage in the middle of the file: an mdat that really ends
+    /// where the next fragment starts, or damaged bytes up to the next fragment, read as an mdat. Their headers
+    /// are written as they are here when the file is converted.
+    /// </summary>
+    public List<Box> HeaderFixes { get; } = new();
+
     /// <summary>Things worth knowing about the file (gaps, cut-off data, unusual layout), for the log.</summary>
     public List<string> Notes { get; } = new();
 
@@ -177,27 +222,93 @@ internal static class Mp4Scanner
     /// <summary>sample_is_non_sync_sample in the ISO sample flags.</summary>
     private const uint NonSyncSample = 0x10000;
 
+    /// <summary>How far past damage the next fragment is looked for (damage normally spans a fragment or two).</summary>
+    private const long MaxResyncDistance = 64L * 1024 * 1024;
+
+    /// <summary>Damaged places the scan steps over at most (a guard against a file that is nothing but damage).</summary>
+    private const int MaxResyncs = 10_000;
+
+    /// <summary>Samples per run when the run has no per-sample fields to check the count against.</summary>
+    private const uint MaxSamplesPerRun = 1_000_000;
+
+    /// <summary>Samples at the end of a track checked for zeros (the length of the file reached the disk, the data did not).</summary>
+    private const int MaxZeroFilledSamples = 100_000;
+
     public static Mp4Layout Scan(Stream stream)
     {
         var layout = new Mp4Layout { FileLength = stream.Length };
         long position = 0;
+        int resyncs = 0;
         while (position + 8 <= layout.FileLength)
         {
-            if (!BoxIo.TryReadHeader(stream, position, layout.FileLength, out Box box, out bool fits))
+            bool valid = BoxIo.TryReadHeader(stream, position, layout.FileLength, out Box box, out bool fits);
+            bool mdatToTheEnd = valid && box.Type == "mdat" && (box.OpenEnded || !fits);
+            if (valid && fits && !mdatToTheEnd)
             {
-                layout.Notes.Add(Invariant($"no valid box at byte {position:N0}; {layout.FileLength - position:N0} byte(s) after it are not used"));
-                break;
+                layout.TopLevel.Add(box);
+                position = box.End;
+                continue;
             }
 
-            if (!fits)
+            // The end of a recording cut off by a crash, or damage in the middle. When a fragment follows, the
+            // recording goes on there and nothing after the damage is lost: the mdat before it (or the one that
+            // claims to run to the end) really ends where that fragment starts, or the damaged bytes become an mdat.
+            Box? previous = layout.TopLevel.Count > 0 ? layout.TopLevel[^1] : null;
+            Box? mdat = mdatToTheEnd ? box : previous is { Type: "mdat" } before ? before : null;
+            long searchFrom = mdat is { } m ? m.PayloadPosition : position + 8;
+            long? next = resyncs < MaxResyncs
+                ? FindNextFragment(stream, searchFrom, Math.Max(searchFrom, position) + MaxResyncDistance, layout.FileLength)
+                : null;
+            if (next is { } at)
+            {
+                resyncs++;
+                Box fixedBox;
+                if (mdat is { } data)
+                {
+                    fixedBox = data with { Size = at - data.Position, OpenEnded = false };
+                    if (mdatToTheEnd)
+                    {
+                        layout.TopLevel.Add(fixedBox);
+                    }
+                    else
+                    {
+                        layout.TopLevel[^1] = fixedBox;
+                    }
+
+                    layout.Notes.Add(Invariant($"the mdat at byte {data.Position:N0} really ends at the next fragment (byte {at:N0}); the recording goes on there"));
+                }
+                else
+                {
+                    fixedBox = new Box("mdat", position, at - position, 8);
+                    layout.TopLevel.Add(fixedBox);
+                    layout.Notes.Add(Invariant($"bytes {position:N0} to {at:N0} are damaged; the recording goes on with the fragment after them"));
+                }
+
+                layout.HeaderFixes.RemoveAll(b => b.Position == fixedBox.Position);
+                layout.HeaderFixes.Add(fixedBox);
+                position = at;
+                continue;
+            }
+
+            if (mdatToTheEnd && box.OpenEnded)
+            {
+                // The last mdat, "to the end of the file": kept, and given its real size when the file is converted.
+                layout.TopLevel.Add(box);
+                position = box.End;
+                continue;
+            }
+
+            if (valid)
             {
                 layout.CutOff = box;
                 layout.Notes.Add(Invariant($"{box.Type} at byte {box.Position:N0} is cut off: {box.Size:N0} bytes long, but only {layout.FileLength - box.Position:N0} are in the file"));
-                break;
+            }
+            else
+            {
+                layout.Notes.Add(Invariant($"no valid box at byte {position:N0}; {layout.FileLength - position:N0} byte(s) after it are not used"));
             }
 
-            layout.TopLevel.Add(box);
-            position = box.End;
+            break;
         }
 
         layout.ValidEnd = position;
@@ -341,9 +452,10 @@ internal static class Mp4Scanner
     }
 
     /// <summary>
-    /// Reads every movie fragment and keeps each sample whose bytes are really in the file, inside an mdat. Per track
-    /// it stops at the first missing sample, so what is kept always plays from the start without holes. Then works out
-    /// where the file has to end.
+    /// Reads every movie fragment and keeps each sample whose bytes are really in the file, inside an mdat. A sample
+    /// that is missing (cut off, or in a damaged part) is left out; when its track goes on after it, the sample before
+    /// the gap is shown for the missing time, so everything after it keeps its place in the timeline. Samples at the
+    /// end that are only zeros are left out too. Then works out where the file has to end.
     /// </summary>
     private static void ReadFragments(Stream stream, Mp4Layout layout)
     {
@@ -363,14 +475,12 @@ internal static class Mp4Scanner
             mdats.Add(cutOffMdat);
         }
 
-        long lastUsedEnd = 0;
-        Box? lastUsedMdat = null;
         foreach (Box moof in layout.TopLevel.Where(b => b.Type == "moof"))
         {
             if (moof.Size > MaxMoovSize)
             {
-                layout.Notes.Add(Invariant($"moof at byte {moof.Position:N0} is too large to be real; fragments after it are not used"));
-                break;
+                layout.Notes.Add(Invariant($"moof at byte {moof.Position:N0} is too large to be real; it is skipped"));
+                continue;
             }
 
             byte[] data = BoxIo.ReadExactly(stream, moof.Position, (int)moof.Size);
@@ -379,7 +489,28 @@ internal static class Mp4Scanner
             long nextTrafBase = moof.Position;
             foreach (Box traf in BoxIo.Children(data, (int)root.PayloadPosition, (int)root.End).Where(b => b.Type == "traf"))
             {
-                nextTrafBase = ReadTrackFragment(data, traf, moof.Position, nextTrafBase, tracks, mdats, layout, ref lastUsedEnd, ref lastUsedMdat);
+                nextTrafBase = ReadTrackFragment(data, traf, moof.Position, nextTrafBase, tracks, mdats, layout);
+            }
+        }
+
+        long lastUsedEnd = 0;
+        Box? lastUsedMdat = null;
+        foreach (TrackSamples track in layout.Tracks)
+        {
+            if (track.MissingSamples > 0)
+            {
+                layout.Notes.Add(Invariant($"track {track.Id} ends after {track.Count} samples: the {track.MissingSamples} after it (from byte {track.MissingFrom:N0}) are not in the file"));
+            }
+
+            DropZeroFilledEnd(stream, track, layout);
+            if (track.Count > 0)
+            {
+                (long offset, uint size) = track.LastSample();
+                if (offset + size > lastUsedEnd)
+                {
+                    lastUsedEnd = offset + size;
+                    lastUsedMdat = Containing(mdats, offset, size, layout.FileLength);
+                }
             }
         }
 
@@ -407,9 +538,47 @@ internal static class Mp4Scanner
         }
     }
 
+    /// <summary>
+    /// Samples at the end whose bytes are zeros are left out: after a power cut the file's length can reach the disk
+    /// while its last data does not. A video sample starts with the length of its first NAL unit, which is never 0;
+    /// a sound frame is never all zeros.
+    /// </summary>
+    private static void DropZeroFilledEnd(Stream stream, TrackSamples track, Mp4Layout layout)
+    {
+        int checkedBytes = track.Header.Handler switch
+        {
+            "vide" => 4,
+            "soun" => 1 << 16,
+            _ => 0,
+        };
+        if (checkedBytes == 0)
+        {
+            return;
+        }
+
+        int dropped = 0;
+        while (track.Count > 0 && dropped < MaxZeroFilledSamples)
+        {
+            (long offset, uint size) = track.LastSample();
+            int length = (int)Math.Min(size, (uint)checkedBytes);
+            if (length == 0 || BoxIo.ReadExactly(stream, offset, length).AsSpan().ContainsAnyExcept((byte)0))
+            {
+                break;
+            }
+
+            track.RemoveLast();
+            dropped++;
+        }
+
+        if (dropped > 0)
+        {
+            layout.Notes.Add(Invariant($"track {track.Id}: the last {dropped} sample(s) are only zeros (never written to the disk) and are left out"));
+        }
+    }
+
     /// <summary>Reads one traf; returns where the next traf's data starts by default.</summary>
     private static long ReadTrackFragment(
-        byte[] data, Box traf, long moofPosition, long defaultBase, Dictionary<uint, TrackSamples> tracks, List<Box> mdats, Mp4Layout layout, ref long lastUsedEnd, ref Box? lastUsedMdat)
+        byte[] data, Box traf, long moofPosition, long defaultBase, Dictionary<uint, TrackSamples> tracks, List<Box> mdats, Mp4Layout layout)
     {
         Box? tfhd = BoxIo.Child(data, traf, "tfhd");
         if (tfhd is not { } th || th.PayloadSize < 8)
@@ -428,11 +597,19 @@ internal static class Mp4Scanner
         }
 
         TrackHeader header = track.Header;
+        int needed = 8 + ((tfhdFlags & TfhdBaseDataOffset) != 0 ? 8 : 0) + ((tfhdFlags & TfhdDescriptionIndex) != 0 ? 4 : 0)
+            + ((tfhdFlags & TfhdDefaultDuration) != 0 ? 4 : 0) + ((tfhdFlags & TfhdDefaultSize) != 0 ? 4 : 0) + ((tfhdFlags & TfhdDefaultFlags) != 0 ? 4 : 0);
+        if (th.PayloadSize < needed)
+        {
+            layout.Notes.Add(Invariant($"a tfhd of track {trackId} is too short for its fields; that fragment was skipped"));
+            return defaultBase;
+        }
+
         int field = at + 8;
         long baseOffset = (tfhdFlags & TfhdDefaultBaseIsMoof) != 0 ? moofPosition : defaultBase;
         if ((tfhdFlags & TfhdBaseDataOffset) != 0)
         {
-            baseOffset = (long)BoxIo.U64(data, field);
+            baseOffset = (long)Math.Min(BoxIo.U64(data, field), long.MaxValue / 2);
             field += 8;
         }
 
@@ -466,13 +643,15 @@ internal static class Mp4Scanner
         if (BoxIo.Child(data, traf, "tfdt") is { } tfdt && tfdt.PayloadSize >= 8)
         {
             int body = (int)tfdt.PayloadPosition;
-            decodeTime = data[body] == 1 ? (long)BoxIo.U64(data, body + 4) : BoxIo.U32(data, body + 4);
+            decodeTime = data[body] == 1 && tfdt.PayloadSize >= 12
+                ? (long)Math.Min(BoxIo.U64(data, body + 4), long.MaxValue / 2)
+                : BoxIo.U32(data, body + 4);
         }
 
         long dataEnd = baseOffset;
         foreach (Box trun in BoxIo.Children(data, (int)traf.PayloadPosition, (int)traf.End).Where(b => b.Type == "trun"))
         {
-            dataEnd = ReadTrackRun(data, trun, baseOffset, dataEnd, defaultDuration, defaultSize, defaultFlags, track, mdats, layout, ref decodeTime, ref lastUsedEnd, ref lastUsedMdat);
+            dataEnd = ReadTrackRun(data, trun, baseOffset, dataEnd, defaultDuration, defaultSize, defaultFlags, track, mdats, layout, ref decodeTime);
         }
 
         return dataEnd;
@@ -481,7 +660,7 @@ internal static class Mp4Scanner
     /// <summary>Reads one trun; returns where its data ends (where the next run starts by default).</summary>
     private static long ReadTrackRun(
         byte[] data, Box trun, long baseOffset, long previousEnd, uint defaultDuration, uint defaultSize, uint defaultFlags,
-        TrackSamples track, List<Box> mdats, Mp4Layout layout, ref long? decodeTime, ref long lastUsedEnd, ref Box? lastUsedMdat)
+        TrackSamples track, List<Box> mdats, Mp4Layout layout, ref long? decodeTime)
     {
         int body = (int)trun.PayloadPosition;
         if (trun.PayloadSize < 8)
@@ -494,6 +673,13 @@ internal static class Mp4Scanner
         uint count = BoxIo.U32(data, body + 4);
         int field = body + 8;
         long offset = previousEnd;
+        int fixedFields = ((flags & TrunDataOffset) != 0 ? 4 : 0) + ((flags & TrunFirstSampleFlags) != 0 ? 4 : 0);
+        if (trun.End - field < fixedFields)
+        {
+            layout.Notes.Add(Invariant($"a trun of track {track.Id} is too short for its fields; it is skipped"));
+            return previousEnd;
+        }
+
         if ((flags & TrunDataOffset) != 0)
         {
             offset = baseOffset + (int)BoxIo.U32(data, field);
@@ -509,15 +695,26 @@ internal static class Mp4Scanner
 
         int perSample = (((flags & TrunDuration) != 0) ? 4 : 0) + (((flags & TrunSize) != 0) ? 4 : 0)
             + (((flags & TrunFlags) != 0) ? 4 : 0) + (((flags & TrunCompositionOffset) != 0) ? 4 : 0);
-        if (count > 0 && (long)count * perSample > trun.End - field)
+        long room = trun.End - field;
+        if (perSample > 0)
         {
-            layout.Notes.Add(Invariant($"a trun of track {track.Id} lists more samples than it has room for; it is not used"));
-            track.Stopped = true;
+            // A run is exactly as long as its entries: a count that disagrees with the box size is damaged, and
+            // the size (which the walk through the file already checked) decides.
+            long capacity = room / perSample;
+            if (count != capacity && (count > capacity || room % perSample == 0))
+            {
+                layout.Notes.Add(Invariant($"a trun of track {track.Id} says {count} samples but has room for {capacity}; {capacity} are read"));
+                count = (uint)capacity;
+            }
+        }
+        else if (count > MaxSamplesPerRun)
+        {
+            layout.Notes.Add(Invariant($"a trun of track {track.Id} says {count} samples; it is skipped"));
             return previousEnd;
         }
 
-        int chunkFirst = track.Count;
-        long chunkOffset = offset;
+        int chunkFirst = 0;
+        long chunkOffset = 0;
         int chunkCount = 0;
         for (uint i = 0; i < count; i++)
         {
@@ -550,59 +747,102 @@ internal static class Mp4Scanner
                 field += 4;
             }
 
-            if (!track.Stopped)
+            Box? mdat = Containing(mdats, offset, size, layout.FileLength);
+            if (mdat is null)
             {
-                Box? mdat = Containing(mdats, offset, size, layout.FileLength);
-                if (mdat is null)
+                // Not in the file (cut off by a crash) or in a damaged part: left out, and the samples kept so far
+                // end here as one run of bytes.
+                AddChunk(track, chunkFirst, chunkOffset, chunkCount);
+                chunkCount = 0;
+                if (track.MissingSamples++ == 0)
                 {
-                    track.Stopped = true;
-                    layout.Notes.Add(Invariant($"track {track.Id} ends after {track.Count} samples: the next one (byte {offset:N0}, {size:N0} bytes) is not in the file"));
+                    track.MissingFrom = offset;
                 }
-                else
-                {
-                    if (decodeTime is { } time)
-                    {
-                        AlignDecodeTime(track, time, layout);
-                        decodeTime = null;
-                    }
 
-                    track.Sizes.Add(size);
-                    track.Durations.Add(duration);
-                    track.CompositionOffsets.Add(composition);
-                    bool sync = (sampleFlags & NonSyncSample) == 0;
-                    track.Sync.Add(sync);
-                    track.AnyNonSync |= !sync;
-                    track.AnyCompositionOffset |= composition != 0;
-                    track.DecodeTime += duration;
-                    track.Bytes += size;
-                    chunkCount++;
-                    if (offset + size >= lastUsedEnd)
-                    {
-                        lastUsedEnd = offset + size;
-                        lastUsedMdat = mdat;
-                    }
+                track.MissingDuration += duration;
+                if (decodeTime is { } expected)
+                {
+                    decodeTime = expected + duration;
                 }
+            }
+            else
+            {
+                if (decodeTime is { } time)
+                {
+                    // The fragment's own decode time places this sample exactly (whatever was missing before it).
+                    track.MissingSamples = 0;
+                    track.MissingDuration = 0;
+                    AlignDecodeTime(track, time, layout);
+                    decodeTime = null;
+                }
+                else if (track.MissingSamples > 0)
+                {
+                    BridgeGap(track, layout);
+                }
+
+                if (chunkCount == 0)
+                {
+                    chunkFirst = track.Count;
+                    chunkOffset = offset;
+                }
+
+                track.Sizes.Add(size);
+                track.Durations.Add(duration);
+                track.CompositionOffsets.Add(composition);
+                bool sync = (sampleFlags & NonSyncSample) == 0;
+                track.Sync.Add(sync);
+                track.AnyNonSync |= !sync;
+                track.AnyCompositionOffset |= composition != 0;
+                track.DecodeTime += duration;
+                track.Bytes += size;
+                chunkCount++;
             }
 
             offset += size;
         }
 
-        if (chunkCount > 0)
+        AddChunk(track, chunkFirst, chunkOffset, chunkCount);
+        return offset;
+    }
+
+    private static void AddChunk(TrackSamples track, int first, long offset, int count)
+    {
+        if (count > 0)
         {
-            track.Chunks.Add(new Chunk(chunkOffset, chunkFirst, chunkCount));
+            track.Chunks.Add(new Chunk(offset, first, count));
+        }
+    }
+
+    /// <summary>
+    /// Samples were missing in the middle of a track: the sample before them is shown for their time (the picture
+    /// holds, the sound is silent), so the samples after them keep their place and stay in sync with the other track.
+    /// </summary>
+    private static void BridgeGap(TrackSamples track, Mp4Layout layout)
+    {
+        long gap = track.MissingDuration;
+        if (track.Count == 0)
+        {
+            // The track's first samples are missing: it starts that much later.
+            track.FirstDecodeTime += gap;
+            track.DecodeTime += gap;
+        }
+        else
+        {
+            uint last = track.Durations[^1];
+            long lengthened = Math.Min(uint.MaxValue, last + gap);
+            track.Durations[^1] = (uint)lengthened;
+            track.DecodeTime += lengthened - last;
         }
 
-        return offset;
+        string what = track.Header.Handler == "soun" ? "the sound is silent" : "the picture holds";
+        layout.Notes.Add(Invariant($"track {track.Id}: {track.MissingSamples} sample(s) from byte {track.MissingFrom:N0} are damaged or missing; {what} for {gap / (double)track.Header.Timescale:0.###} s there"));
+        track.MissingSamples = 0;
+        track.MissingDuration = 0;
     }
 
     /// <summary>The track's first fragment sets its start; later ones that disagree with the running total move the previous sample's end.</summary>
     private static void AlignDecodeTime(TrackSamples track, long time, Mp4Layout layout)
     {
-        if (track.Stopped)
-        {
-            return;
-        }
-
         if (track.Count == 0)
         {
             track.FirstDecodeTime = time;
@@ -624,6 +864,55 @@ internal static class Mp4Scanner
         {
             layout.Notes.Add(Invariant($"track {track.Id}: the fragment at decode time {time} is {gap} ticks from where the previous one ended; the previous sample was {(gap > 0 ? "lengthened" : "shortened")}"));
         }
+    }
+
+    /// <summary>
+    /// Where the next complete movie fragment starts (a moof box whose first child is its mfhd, which fits in the
+    /// file), looking from <paramref name="from"/> up to <paramref name="to"/>; null if there is none.
+    /// </summary>
+    private static long? FindNextFragment(Stream stream, long from, long to, long fileLength)
+    {
+        const int Signature = 16; // size, "moof", mfhd size 16, "mfhd"
+        const int Block = 1 << 20;
+        var buffer = new byte[Block];
+        long start = from;
+        while (start <= to && fileLength - start >= Signature)
+        {
+            int count = (int)Math.Min(Block, fileLength - start);
+            stream.Position = start;
+            stream.ReadExactly(buffer.AsSpan(0, count));
+            ReadOnlySpan<byte> data = buffer.AsSpan(0, count);
+            int lastCandidate = (int)Math.Min(count - Signature, to - start);
+            int searchAt = 4;
+            while (searchAt <= lastCandidate + 4)
+            {
+                int found = data[searchAt..].IndexOf("moof"u8);
+                if (found < 0)
+                {
+                    break;
+                }
+
+                int candidate = searchAt + found - 4;
+                if (candidate > lastCandidate)
+                {
+                    break;
+                }
+
+                uint size = BoxIo.U32(data, candidate);
+                if (BoxIo.U32(data, candidate + 8) == 16 && data.Slice(candidate + 12, 4).SequenceEqual("mfhd"u8)
+                    && size >= 24 && size <= MaxMoovSize && start + candidate + size <= fileLength)
+                {
+                    return start + candidate;
+                }
+
+                searchAt += found + 1;
+            }
+
+            // The next block starts right after the last position checked in this one.
+            start += lastCandidate + 1;
+        }
+
+        return null;
     }
 
     /// <summary>The mdat whose payload holds the whole sample, or null. <paramref name="mdats"/> is in file order.</summary>
