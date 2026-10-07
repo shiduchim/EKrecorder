@@ -22,7 +22,10 @@ namespace EKrecorder.Shell;
 /// </summary>
 internal sealed class SettingsForm : Form
 {
-    private const int WidthDip = 640;
+    private const int WidthDip = 680;
+    private const int ControlWidthDip = 248;
+    private const float HeardLevel = 0.01f; // -40 dBFS: a voice, not room noise
+    private const float PlayingLevel = 0.003f; // -50 dBFS
 
     private readonly AppSettings _original;
     private readonly HotkeyManager _hotkeys;
@@ -32,31 +35,34 @@ internal sealed class SettingsForm : Form
     private readonly Panel _content = new();
     private readonly Label _recordingHeading = Heading("Recording");
     private readonly Label _audioHeading = Heading("Audio");
-    private readonly Label _controlsHeading = Heading("Controls");
+    private readonly Label _controlsHeading = Heading("Start and stop");
     private readonly Panel _banner = new();
     private readonly Card _monitorCard = new() { Glyph = Glyphs.Monitor, Title = "Monitor" };
     private readonly Card _videoCard = new() { Glyph = Glyphs.Video, Title = "Video quality" };
-    private readonly Card _folderCard = new() { Glyph = Glyphs.Folder, Title = "Save recordings to", PathEllipsis = true };
+    private readonly Card _folderCard = new() { Glyph = Glyphs.Folder, Title = "Save recordings to" };
     private readonly Card _micCard = new() { Glyph = Glyphs.Microphone, Title = "Microphone" };
     private readonly Card _outputCard = new() { Glyph = Glyphs.Speaker, Title = "Computer audio" };
     private readonly Card _audioCard = new() { Glyph = Glyphs.Equalizer, Title = "Audio quality" };
-    private readonly Card _shortcutCard = new() { Glyph = Glyphs.Keyboard, Title = "Start/stop shortcut" };
+    private readonly Card _shortcutCard = new() { Glyph = Glyphs.Keyboard, Title = "Shortcut" };
     private readonly Card _stopCard = new() { Glyph = Glyphs.Timer, Title = "Stop recording after" };
     private readonly Card _startupCard = new() { Glyph = Glyphs.Power, Title = "Start with Windows" };
     private readonly MonitorPicker _monitorPicker = new() { AccessibleName = "Monitor to record" };
     private readonly PillButton _identifyButton = new() { Text = "Identify" };
     private readonly StepSlider _videoQuality = new() { AccessibleName = "Video quality" };
-    private readonly PillButton _browse = new() { Text = "Browse…" };
-    private readonly ComboBox _microphone = DeviceList("Microphone");
-    private readonly LevelMeter _micMeter = new() { AccessibleName = "Microphone level" };
-    private readonly ComboBox _output = DeviceList("Computer audio");
-    private readonly LevelMeter _outputMeter = new() { AccessibleName = "Computer audio level" };
-    private readonly PillButton _testSound = new() { Text = "Play a test sound", Style = PillStyle.Link, Glyph = Glyphs.Play };
+    private readonly PillButton _browse = new() { Text = "Change…", AccessibleName = "Change the recordings folder" };
+    private readonly ThemedComboBox _microphone = DeviceList("Microphone");
+    private readonly LevelMeter _micMeter = new() { AccessibleName = "Microphone level", Tag = Line2 };
+    private readonly StatusLine _micStatus = new() { Tag = Line2 };
+    private readonly ThemedComboBox _output = DeviceList("Computer audio");
+    private readonly LevelMeter _outputMeter = new() { AccessibleName = "Computer audio level", Tag = Line2 };
+    private readonly StatusLine _outputStatus = new() { Tag = Line2 };
+    private readonly PillButton _testSound = new() { Style = PillStyle.Icon, Glyph = Glyphs.Play, AccessibleName = "Play a test sound" };
     private readonly StepSlider _audioQuality = new() { AccessibleName = "Audio quality" };
-    private readonly HotkeyBox _shortcut = new() { AccessibleName = "Start and stop shortcut", BorderStyle = BorderStyle.FixedSingle };
-    private readonly ComboBox _maxTime = new() { DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "Stop recording after" };
+    private readonly HotkeyBox _shortcut = new() { AccessibleName = "Start and stop shortcut" };
+    private readonly FieldHost _shortcutField;
+    private readonly ThemedComboBox _maxTime = new() { AccessibleName = "Stop recording after" };
     private readonly ToggleSwitch _startWithWindows = new() { AccessibleName = "Start EKrecorder with Windows" };
-    private readonly Label _version = new() { AutoSize = true, Text = $"EKrecorder {EnvironmentInfo.ShortVersion}" };
+    private readonly Panel _footer = new();
     private readonly PillButton _save = new() { Text = "Save", Style = PillStyle.Accent };
     private readonly PillButton _cancel = new() { Text = "Cancel", DialogResult = DialogResult.Cancel };
     private readonly AudioPreview _preview = new();
@@ -73,6 +79,16 @@ internal sealed class SettingsForm : Form
     private string? _shortcutProblem;
     private System.Media.SoundPlayer? _testPlayer;
     private MemoryStream? _testWave;
+    private bool _micHeard;
+    private bool? _micMuted;
+    private bool _muteCheckRunning;
+    private long _nextMuteCheck;
+    private long _outputHeardAt;
+    private string _micDefaultName = "";
+    private string _outputDefaultName = "";
+
+    /// <summary>Marks the controls on a device card's second line (they sit under the title, by design).</summary>
+    private const string Line2 = "line 2";
 
     public SettingsForm(AppSettings settings, IReadOnlyList<MonitorInfo> monitors, HotkeyManager hotkeys, Func<AppSettings, string?> apply, Action<IReadOnlyList<MonitorInfo>> identify)
     {
@@ -85,7 +101,7 @@ internal sealed class SettingsForm : Form
         _monitorName = settings.MonitorName;
         _folder = settings.RecordingFolder ?? AppPaths.DesktopRecordings;
 
-        Text = "EKrecorder Settings";
+        Text = "EKrecorder settings";
         Icon = AppIcons.App;
         AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -98,15 +114,18 @@ internal sealed class SettingsForm : Form
         _theme = UiTheme.Current();
         _fonts = new UiFonts(_scale);
 
+        _shortcutField = new FieldHost(_shortcut) { Tag = "field" };
         _content.Controls.AddRange([_banner, _recordingHeading, _monitorCard, _videoCard, _folderCard, _audioHeading, _micCard, _outputCard, _audioCard,
-            _controlsHeading, _shortcutCard, _stopCard, _startupCard, _version, _save, _cancel]);
+            _controlsHeading, _shortcutCard, _stopCard, _startupCard, _footer]);
+        _footer.Controls.AddRange([_save, _cancel]);
+        _footer.Paint += PaintFooter;
         _monitorCard.Controls.AddRange([_identifyButton, _monitorPicker]);
         _videoCard.Controls.Add(_videoQuality);
         _folderCard.Controls.Add(_browse);
-        _micCard.Controls.AddRange([_microphone, _micMeter]);
-        _outputCard.Controls.AddRange([_output, _outputMeter, _testSound]);
+        _micCard.Controls.AddRange([_microphone, _micMeter, _micStatus]);
+        _outputCard.Controls.AddRange([_testSound, _output, _outputMeter, _outputStatus]);
         _audioCard.Controls.Add(_audioQuality);
-        _shortcutCard.Controls.Add(_shortcut);
+        _shortcutCard.Controls.Add(_shortcutField);
         _stopCard.Controls.Add(_maxTime);
         _startupCard.Controls.Add(_startWithWindows);
         Controls.Add(_content);
@@ -125,6 +144,7 @@ internal sealed class SettingsForm : Form
             m.StableId,
             m.Number.ToString(CultureInfo.InvariantCulture),
             m.Bounds,
+            ResolutionName(m.Bounds.Size),
             $"{m.Name}: {Describe(m)}")).ToList();
         _monitorPicker.SelectedId = SelectedMonitor()?.StableId is { } shown && (_monitorId is null || _monitorId == shown) ? shown : null;
         _shortcut.Value = settings.Hotkey;
@@ -135,11 +155,11 @@ internal sealed class SettingsForm : Form
 
         _maxTime.SelectedIndex = Math.Max(0, AppSettings.MaxHoursChoices.ToList().IndexOf(settings.MaxRecordingHours));
         _startWithWindows.Checked = settings.StartWithWindows;
-        SetDevices(_microphone, [], settings.MicrophoneId, settings.MicrophoneName);
-        SetDevices(_output, [], settings.OutputId, settings.OutputName);
+        SetDevices(_microphone, DefaultLabel(""), [], settings.MicrophoneId, settings.MicrophoneName);
+        SetDevices(_output, DefaultLabel(""), [], settings.OutputId, settings.OutputName);
 
-        _tips.SetToolTip(_identifyButton, "Shows each monitor's number on that monitor for a few seconds.");
-        _tips.SetToolTip(_testSound, "Plays a short sound on Windows' default speakers or headset; the meter above should move.");
+        _tips.SetToolTip(_identifyButton, "Shows each monitor's number on that monitor for a few seconds");
+        _tips.SetToolTip(_testSound, "Play a test sound (on Windows' default speakers or headset)");
         _monitorPicker.SelectionChanged += (_, _) =>
         {
             if (_monitorPicker.SelectedId is { } id && _monitors.FirstOrDefault(m => m.StableId == id) is { } monitor)
@@ -159,6 +179,7 @@ internal sealed class SettingsForm : Form
         _microphone.SelectedIndexChanged += (_, _) => DevicesChanged();
         _output.SelectedIndexChanged += (_, _) => DevicesChanged();
         _testSound.Click += (_, _) => PlayTestSound();
+        _micStatus.Link.Click += (_, _) => Unmute();
         _shortcut.GotFocus += (_, _) => _hotkeys.Suspend();
         _shortcut.LostFocus += (_, _) => _hotkeys.Resume();
         _shortcut.ValueChanged += (_, _) => CheckShortcut();
@@ -185,15 +206,14 @@ internal sealed class SettingsForm : Form
     }
 
     /// <summary>
-    /// Self-test only: what is wrong with the layout (controls outside their card or overlapping, text that cannot
-    /// fit), or nothing.
+    /// Self-test only: what is wrong with the layout (controls outside their card or overlapping, a control over the
+    /// titles, text that cannot fit), or nothing.
     /// </summary>
     public IReadOnlyList<string> CheckLayout()
     {
         var problems = new List<string>();
         int margin = D(6);
-        Card[] cards = [_monitorCard, _videoCard, _folderCard, _micCard, _outputCard, _audioCard, _shortcutCard, _stopCard, _startupCard];
-        foreach (Card card in cards)
+        foreach (Card card in Cards())
         {
             Rectangle inner = Rectangle.Inflate(new Rectangle(Point.Empty, card.Size), -margin, -margin);
             var children = card.Controls.Cast<Control>().Where(c => c.Visible).ToList();
@@ -204,9 +224,10 @@ internal sealed class SettingsForm : Form
                     problems.Add($"{card.Title}: {NameOf(child)} {child.Bounds} is not inside the card {card.Size}");
                 }
 
-                if (child.Left < card.TextRight && child != _testSound)
+                bool underTitle = Equals(child.Tag, Line2) && child.Top >= (card.HeaderHeight > 0 ? card.HeaderHeight : card.Height) - D(8);
+                if (child.Left < card.TextRight && !underTitle)
                 {
-                    problems.Add($"{card.Title}: {NameOf(child)} starts at {child.Left}, inside the text column (ends at {card.TextRight})");
+                    problems.Add($"{card.Title}: {NameOf(child)} starts at {child.Left}, over the title (it ends at {card.TextRight})");
                 }
             }
 
@@ -236,21 +257,26 @@ internal sealed class SettingsForm : Form
             }
         }
 
-        foreach (Control text in new Control[] { _microphone, _output, _maxTime, _shortcut })
+        foreach (PillButton button in new[] { _save, _cancel, _browse, _identifyButton })
         {
-            int needed = TextRenderer.MeasureText(text.Text, text.Font).Width + (text is ComboBox ? D(24) : 0);
-            if (needed > text.Width)
+            int needed = TextRenderer.MeasureText(button.Text, _fonts.Body, Size.Empty, TextFormatFlags.NoPadding).Width + D(16);
+            if (button.Visible && needed > button.Width)
             {
-                problems.Add($"{NameOf(text)}: \"{text.Text}\" needs {needed} px, the box is {text.Width}");
+                problems.Add($"\"{button.Text}\" needs {needed} px, the button is {button.Width}");
             }
+        }
+
+        if (TextRenderer.MeasureText(_shortcut.Text, _shortcut.Font).Width > _shortcut.Width)
+        {
+            problems.Add($"the shortcut \"{_shortcut.Text}\" does not fit its box");
         }
 
         return problems;
 
-        static string NameOf(Control c) => c.AccessibleName ?? c.Text ?? c.GetType().Name;
+        static string NameOf(Control c) => c.AccessibleName ?? (c.Text.Length > 0 ? c.Text : c.GetType().Name);
     }
 
-    /// <summary>Shows or hides "Recording now — changes apply to the next recording".</summary>
+    /// <summary>Shows or hides "Recording now · Changes apply to the next recording".</summary>
     public void SetRecording(bool recording)
     {
         if (_recording == recording)
@@ -262,19 +288,22 @@ internal sealed class SettingsForm : Form
         LayoutAll();
     }
 
-    /// <summary>Fills the device lists (listing does not open any device).</summary>
+    /// <summary>Fills the device lists and names Windows' defaults (listing does not open any device).</summary>
     public async Task LoadDevicesAsync()
     {
         try
         {
-            (List<AudioDevice> microphones, List<AudioDevice> outputs) = await Task.Run(() => (CoreAudio.ListMicrophones(), CoreAudio.ListOutputs()));
+            (List<AudioDevice> microphones, List<AudioDevice> outputs, (string? Microphone, IReadOnlyList<string> Outputs) defaults) =
+                await Task.Run(() => (CoreAudio.ListMicrophones(), CoreAudio.ListOutputs(), CoreAudio.DefaultNames()));
             if (IsDisposed)
             {
                 return;
             }
 
-            SetDevices(_microphone, microphones, (_microphone.SelectedItem as DeviceChoice)?.Id, (_microphone.SelectedItem as DeviceChoice)?.Name);
-            SetDevices(_output, outputs, (_output.SelectedItem as DeviceChoice)?.Id, (_output.SelectedItem as DeviceChoice)?.Name);
+            _micDefaultName = defaults.Microphone is { } microphone ? ShortName(microphone) : "";
+            _outputDefaultName = string.Join(" + ", defaults.Outputs.Select(ShortName));
+            SetDevices(_microphone, DefaultLabel(_micDefaultName), microphones, (_microphone.SelectedItem as DeviceChoice)?.Id, (_microphone.SelectedItem as DeviceChoice)?.Name);
+            SetDevices(_output, DefaultLabel(_outputDefaultName), outputs, (_output.SelectedItem as DeviceChoice)?.Id, (_output.SelectedItem as DeviceChoice)?.Name);
             DevicesChanged();
         }
         catch (Exception ex)
@@ -290,6 +319,15 @@ internal sealed class SettingsForm : Form
         {
             SetScale(DeviceDpi / 96f);
         }
+
+        // The title bar in the page colour (Windows 11), dark in dark mode.
+        int dark = _theme.Dark ? 1 : 0;
+        AppNative.DwmSetWindowAttribute(Handle, AppNative.DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int));
+        if (!_theme.HighContrast)
+        {
+            int caption = ColorTranslator.ToWin32(_theme.Page);
+            AppNative.DwmSetWindowAttribute(Handle, AppNative.DWMWA_CAPTION_COLOR, ref caption, sizeof(int));
+        }
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -304,7 +342,7 @@ internal sealed class SettingsForm : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        StartPreview();
+        BeginInvoke(StartPreview);
     }
 
     protected override void OnResize(EventArgs e)
@@ -319,6 +357,21 @@ internal sealed class SettingsForm : Form
         {
             StartPreview();
         }
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        if (!Visible)
+        {
+            StopPreview();
+        }
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        StopPreview();
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -345,14 +398,27 @@ internal sealed class SettingsForm : Form
 
     private static Label Heading(string text) => new() { Text = text, AutoSize = true, UseMnemonic = false };
 
-    private static ComboBox DeviceList(string name)
+    private static ThemedComboBox DeviceList(string name)
     {
-        var box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = name };
-        box.Items.Add(new DeviceChoice(null, "Windows default"));
+        var box = new ThemedComboBox { AccessibleName = name };
+        box.Items.Add(new DeviceChoice(null, DefaultLabel("")));
         return box;
     }
 
-    /// <summary>"LS32D80xU · 3840 × 2160 · main".</summary>
+    private static string DefaultLabel(string deviceName) => deviceName.Length > 0 ? $"Windows default ({deviceName})" : "Windows default";
+
+    /// <summary>"Headset Microphone (JLAB TALK GO)" → "JLAB TALK GO": the device, without what Windows calls its connector.</summary>
+    private static string ShortName(string name)
+    {
+        int open = name.IndexOf('(', StringComparison.Ordinal);
+        return open > 0 && name.EndsWith(')') && name.Length - open > 3 ? name[(open + 1)..^1] : name;
+    }
+
+    /// <summary>"Monitor 2 · Main · 4K".</summary>
+    private static string Summary(MonitorInfo monitor) =>
+        string.Join(" · ", new[] { monitor.Name, monitor.IsPrimary ? "Main" : "", ResolutionName(monitor.Bounds.Size) }.Where(p => p.Length > 0));
+
+    /// <summary>"PHL 243V7 · 1920 × 1080 · main" (the tooltips).</summary>
     private static string Describe(MonitorInfo monitor) => string.Join(" · ", new[]
     {
         monitor.FriendlyName,
@@ -360,10 +426,17 @@ internal sealed class SettingsForm : Form
         monitor.IsPrimary ? "main" : "",
     }.Where(p => p.Length > 0));
 
-    /// <summary>Windows' default first, then the devices; a chosen device that is not connected stays listed.</summary>
-    private static void SetDevices(ComboBox box, List<AudioDevice> devices, string? selectedId, string? selectedName)
+    /// <summary>"4K", "1440p", "1080p"… by the shorter side.</summary>
+    private static string ResolutionName(Size size)
     {
-        var items = new List<DeviceChoice> { (DeviceChoice)box.Items[0]! };
+        int lines = Math.Min(size.Width, size.Height);
+        return lines >= 2160 ? "4K" : lines >= 1440 ? "1440p" : lines >= 1080 ? "1080p" : lines >= 720 ? "720p" : string.Create(CultureInfo.InvariantCulture, $"{lines}p");
+    }
+
+    /// <summary>Windows' default first, then the devices; a chosen device that is not connected stays listed.</summary>
+    private static void SetDevices(ThemedComboBox box, string defaultLabel, List<AudioDevice> devices, string? selectedId, string? selectedName)
+    {
+        var items = new List<DeviceChoice> { new(null, defaultLabel) };
         items.AddRange(devices.Select(d => new DeviceChoice(d.Id, d.Name)));
         if (selectedId is not null && items.All(i => i.Id != selectedId))
         {
@@ -375,10 +448,31 @@ internal sealed class SettingsForm : Form
         box.Items.AddRange(items.ToArray<object>());
         box.SelectedItem = items.FirstOrDefault(i => i.Id == selectedId) ?? items[0];
         box.EndUpdate();
+        box.FitDropDown();
     }
 
-    private static string DeviceText(ComboBox box, string defaultText) =>
-        box.SelectedItem is DeviceChoice { Id: not null } choice ? choice.ToString() : defaultText;
+    /// <summary>"Desktop › EKrecordings" for a folder in the user's own folders, else the whole path.</summary>
+    private static string FriendlyPath(string folder)
+    {
+        foreach ((Environment.SpecialFolder special, string name) in new[]
+        {
+            (Environment.SpecialFolder.DesktopDirectory, "Desktop"),
+            (Environment.SpecialFolder.MyVideos, "Videos"),
+            (Environment.SpecialFolder.MyDocuments, "Documents"),
+            (Environment.SpecialFolder.UserProfile, "Home"),
+        })
+        {
+            string root = Environment.GetFolderPath(special);
+            if (root.Length > 0 && (string.Equals(folder, root, StringComparison.OrdinalIgnoreCase)
+                || folder.StartsWith(root.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)))
+            {
+                string rest = folder[root.Length..].Trim('\\');
+                return rest.Length == 0 ? name : $"{name} › {rest.Replace("\\", " › ", StringComparison.Ordinal)}";
+            }
+        }
+
+        return folder;
+    }
 
     private static MemoryStream TestChime()
     {
@@ -414,14 +508,17 @@ internal sealed class SettingsForm : Form
         return stream;
     }
 
+    private Card[] Cards() => [_monitorCard, _videoCard, _folderCard, _micCard, _outputCard, _audioCard, _shortcutCard, _stopCard, _startupCard];
+
     private int D(float dip) => (int)Math.Round(dip * _scale);
 
     private void SetScale(float scale)
     {
         _scale = scale;
-        _fonts.Dispose();
+        UiFonts old = _fonts;
         _fonts = new UiFonts(scale);
         ApplyTheme();
+        old.Dispose();
     }
 
     /// <summary>Colours and fonts for everything, then the layout.</summary>
@@ -430,6 +527,7 @@ internal sealed class SettingsForm : Form
         SuspendLayout();
         BackColor = _theme.Page;
         _content.BackColor = _theme.Page;
+        _footer.BackColor = _theme.Page;
         foreach (Label heading in new[] { _recordingHeading, _audioHeading, _controlsHeading })
         {
             heading.Font = _fonts.Strong;
@@ -437,94 +535,88 @@ internal sealed class SettingsForm : Form
             heading.BackColor = _theme.Page;
         }
 
-        _version.Font = _fonts.Caption;
-        _version.ForeColor = _theme.SecondaryText;
-        _version.BackColor = _theme.Page;
-        foreach (ComboBox box in new[] { _microphone, _output, _maxTime })
-        {
-            box.Font = _fonts.Body;
-            box.BackColor = _theme.Control;
-            box.ForeColor = _theme.Text;
-        }
-
-        _shortcut.Font = _fonts.Body;
-        _shortcut.BackColor = _theme.Control;
-        _shortcut.ForeColor = _theme.Text;
         foreach (IThemed control in new IThemed[]
         {
             _monitorCard, _videoCard, _folderCard, _micCard, _outputCard, _audioCard, _shortcutCard, _stopCard, _startupCard,
-            _monitorPicker, _identifyButton, _videoQuality, _browse, _micMeter, _outputMeter, _testSound, _audioQuality, _startWithWindows, _save, _cancel,
+            _monitorPicker, _identifyButton, _videoQuality, _browse, _microphone, _micMeter, _micStatus, _output, _outputMeter, _outputStatus,
+            _testSound, _audioQuality, _shortcutField, _maxTime, _startWithWindows, _save, _cancel,
         })
         {
             control.ApplyTheme(_theme, _fonts, _scale);
         }
 
+        // The footer buttons sit on the page, not on a card.
+        _save.BackColor = _theme.Page;
+        _cancel.BackColor = _theme.Page;
         ShowDetails();
         LayoutAll();
         ResumeLayout(true);
     }
 
-    /// <summary>Places every card and control; the window is as tall as its contents (and scrolls on a small screen).</summary>
+    /// <summary>Places every card and control; the window is as tall as its contents (and scrolls on a short screen).</summary>
     private void LayoutAll()
     {
         int width = D(WidthDip);
         int pad = D(24);
         int cardWidth = width - (2 * pad);
-        int inside = D(16);
-        int right = cardWidth - inside;
+        int right = cardWidth - D(16);
+        int controlWidth = D(ControlWidthDip);
         int gap = D(4);
-        int y = D(12);
+        int y = D(16);
 
         _banner.Visible = _recording;
         if (_recording)
         {
-            _banner.Bounds = new Rectangle(pad, y, cardWidth, Math.Max(D(40), _fonts.Body.Height + D(20)));
+            _banner.Bounds = new Rectangle(pad, y, cardWidth, Math.Max(D(48), _fonts.Body.Height + D(24)));
             _banner.Invalidate();
-            y = _banner.Bottom + D(8);
+            y = _banner.Bottom + D(4);
         }
 
         // Recording
-        y = PlaceHeading(_recordingHeading, pad, y);
+        y = PlaceHeading(_recordingHeading, pad, y, first: true);
+        bool severalMonitors = _monitors.Count > 1;
+        _monitorPicker.Visible = severalMonitors;
+        _identifyButton.Visible = severalMonitors;
         _identifyButton.Size = _identifyButton.PreferredSize;
-        _monitorPicker.Size = new Size(D(168), D(64));
-        int monitorHeight = Math.Max(D(84), _monitorPicker.Height + D(20));
+        _monitorPicker.Size = new Size(D(176), D(68));
+        int monitorHeight = severalMonitors ? _monitorPicker.Height + D(20) : D(68);
         _monitorCard.Bounds = new Rectangle(pad, y, cardWidth, monitorHeight);
         _monitorPicker.Location = new Point(right - _monitorPicker.Width, (monitorHeight - _monitorPicker.Height) / 2);
         _identifyButton.Location = new Point(_monitorPicker.Left - D(12) - _identifyButton.Width, (monitorHeight - _identifyButton.Height) / 2);
-        _monitorCard.TextRight = _identifyButton.Left - D(12);
+        _monitorCard.TextRight = (severalMonitors ? _identifyButton.Left : right) - D(24);
         y = _monitorCard.Bottom + gap;
 
-        y = PlaceSliderCard(_videoCard, _videoQuality, pad, y, cardWidth, right) + gap;
+        y = PlaceSliderCard(_videoCard, _videoQuality, pad, y, cardWidth, right, controlWidth) + gap;
 
         _browse.Size = _browse.PreferredSize;
-        int folderHeight = Math.Max(D(68), _browse.Height + D(24));
-        _folderCard.Bounds = new Rectangle(pad, y, cardWidth, folderHeight);
-        _browse.Location = new Point(right - _browse.Width, (folderHeight - _browse.Height) / 2);
-        _folderCard.TextRight = _browse.Left - D(16);
-        y = _folderCard.Bottom;
+        y = PlaceSimpleCard(_folderCard, _browse, pad, y, cardWidth, right);
 
         // Audio
-        y = PlaceHeading(_audioHeading, pad, y + D(12));
-        y = PlaceDeviceCard(_micCard, _microphone, _micMeter, null, pad, y, cardWidth, right) + gap;
-        y = PlaceDeviceCard(_outputCard, _output, _outputMeter, _testSound, pad, y, cardWidth, right) + gap;
-        y = PlaceSliderCard(_audioCard, _audioQuality, pad, y, cardWidth, right);
+        y = PlaceHeading(_audioHeading, pad, y, first: false);
+        y = PlaceDeviceCard(_micCard, _microphone, null, _micMeter, _micStatus, pad, y, cardWidth, right, controlWidth) + gap;
+        y = PlaceDeviceCard(_outputCard, _output, _testSound, _outputMeter, _outputStatus, pad, y, cardWidth, right, controlWidth) + gap;
+        y = PlaceSliderCard(_audioCard, _audioQuality, pad, y, cardWidth, right, controlWidth);
 
-        // Controls
-        y = PlaceHeading(_controlsHeading, pad, y + D(12));
-        _shortcut.Width = Math.Max(D(200), TextRenderer.MeasureText("Ctrl + Alt + Shift + Page Down", _fonts.Body).Width + D(16));
-        y = PlaceSimpleCard(_shortcutCard, _shortcut, pad, y, cardWidth, right) + gap;
-        _maxTime.Width = Math.Max(D(140), TextRenderer.MeasureText("12 hours", _fonts.Body).Width + D(40));
+        // Start and stop
+        y = PlaceHeading(_controlsHeading, pad, y, first: false);
+        _shortcutField.Width = controlWidth;
+        y = PlaceSimpleCard(_shortcutCard, _shortcutField, pad, y, cardWidth, right) + gap;
+        _maxTime.Width = controlWidth;
         y = PlaceSimpleCard(_stopCard, _maxTime, pad, y, cardWidth, right) + gap;
         y = PlaceSimpleCard(_startupCard, _startWithWindows, pad, y, cardWidth, right);
 
-        // Buttons
-        y += D(20);
+        // Footer: a line, then Save and Cancel on the right.
+        y += D(24);
         _save.Size = _save.PreferredSize;
         _cancel.Size = _cancel.PreferredSize;
-        _cancel.Location = new Point(pad + cardWidth - _cancel.Width, y);
-        _save.Location = new Point(_cancel.Left - D(8) - _save.Width, y);
-        _version.Location = new Point(pad + D(4), y + ((_save.Height - _version.Height) / 2));
-        y = _save.Bottom + D(20);
+        int buttonWidth = Math.Max(_save.Width, _cancel.Width);
+        _save.Width = buttonWidth;
+        _cancel.Width = buttonWidth;
+        _footer.Bounds = new Rectangle(0, y, width, D(16) + _save.Height + D(16));
+        _cancel.Location = new Point(width - pad - buttonWidth, D(16));
+        _save.Location = new Point(_cancel.Left - D(8) - buttonWidth, D(16));
+        _footer.Invalidate();
+        y = _footer.Bottom;
 
         _content.Bounds = new Rectangle(0, 0, width, y);
         Size client = new(width, y);
@@ -533,58 +625,66 @@ internal sealed class SettingsForm : Form
             // On a screen too short for the whole window, it scrolls.
             Rectangle area = Screen.FromControl(this).WorkingArea;
             int chrome = Height - ClientSize.Height;
-            if (client.Height + chrome > area.Height)
+            if (client.Height + chrome > area.Height * 0.95)
             {
-                client = new Size(width + SystemInformation.VerticalScrollBarWidth, area.Height - chrome);
+                client = new Size(width + SystemInformation.GetVerticalScrollBarWidthForDpi(DeviceDpi), (int)(area.Height * 0.95) - chrome);
             }
         }
 
         ClientSize = client;
     }
 
-    private int PlaceHeading(Label heading, int pad, int y)
+    private int PlaceHeading(Label heading, int pad, int y, bool first)
     {
-        heading.Location = new Point(pad + D(4), y + D(8));
+        heading.Location = new Point(pad + D(1), y + (first ? 0 : D(26)));
         return heading.Bottom + D(8);
     }
 
-    private int PlaceSliderCard(Card card, StepSlider slider, int pad, int y, int cardWidth, int right)
+    private int PlaceSliderCard(Card card, StepSlider slider, int pad, int y, int cardWidth, int right, int controlWidth)
     {
-        slider.Size = new Size(D(264), slider.NeededHeight);
-        int height = Math.Max(D(68), slider.Height + D(20));
+        slider.Size = new Size(controlWidth + D(16), slider.NeededHeight);
+        int height = Math.Max(D(68), slider.Height + D(16));
         card.Bounds = new Rectangle(pad, y, cardWidth, height);
+        card.HeaderHeight = 0;
         slider.Location = new Point(right - slider.Width + D(8), ((height - slider.Height) / 2) + D(2));
-        card.TextRight = slider.Left - D(4);
+        card.TextRight = slider.Left - D(8);
         return card.Bottom;
     }
 
     private int PlaceSimpleCard(Card card, Control control, int pad, int y, int cardWidth, int right)
     {
-        int height = Math.Max(D(64), control.Height + D(24));
+        int height = Math.Max(D(card.Subtitle.Length > 0 ? 68 : 60), control.Height + D(24));
         card.Bounds = new Rectangle(pad, y, cardWidth, height);
+        card.HeaderHeight = 0;
         control.Location = new Point(right - control.Width, (height - control.Height) / 2);
-        card.TextRight = control.Left - D(16);
+        card.TextRight = control.Left - D(24);
         return card.Bottom;
     }
 
-    /// <summary>A device card: the list at the top right, its level meter under it, and (optionally) a link under the description.</summary>
-    private int PlaceDeviceCard(Card card, ComboBox list, LevelMeter meter, PillButton? link, int pad, int y, int cardWidth, int right)
+    /// <summary>
+    /// A device card: the title and the list (with an optional icon button before it) on the first line; the level
+    /// meter and a short status under the title.
+    /// </summary>
+    private int PlaceDeviceCard(Card card, ComboBox list, PillButton? button, LevelMeter meter, StatusLine status, int pad, int y, int cardWidth, int right, int controlWidth)
     {
         int top = D(14);
-        list.Width = D(268);
+        list.Width = controlWidth;
         list.Location = new Point(right - list.Width, top);
-        meter.Bounds = new Rectangle(list.Left, list.Bottom + D(10), list.Width, D(6));
-        card.TextRight = list.Left - D(16);
-        card.TextTop = top + Math.Max(0, (list.Height - _fonts.Body.Height) / 2);
-        int bottom = meter.Bottom + D(14);
-        if (link is not null)
+        int header = (2 * top) + list.Height;
+        if (button is not null)
         {
-            link.Size = link.PreferredSize;
-            link.Location = new Point(card.TextLeft - D(4), card.TextTop + card.TextHeight + D(4));
-            bottom = Math.Max(bottom, link.Bottom + D(10));
+            button.Size = button.PreferredSize;
+            button.Location = new Point(list.Left - D(8) - button.Width, top + ((list.Height - button.Height) / 2));
         }
 
-        card.Bounds = new Rectangle(pad, y, cardWidth, Math.Max(D(76), bottom));
+        card.HeaderHeight = header;
+        card.TextRight = (button?.Left ?? list.Left) - D(24);
+        int line = header - D(4);
+        int meterWidth = D(140);
+        meter.Bounds = new Rectangle(card.TextLeft, line + ((status.Height - D(10)) / 2), meterWidth, D(10));
+        status.Location = new Point(meter.Visible ? meter.Right + D(12) : card.TextLeft, line);
+        status.Width = right - status.Left;
+        card.Bounds = new Rectangle(pad, y, cardWidth, line + status.Height + D(14));
         return card.Bottom;
     }
 
@@ -597,27 +697,40 @@ internal sealed class SettingsForm : Form
             g.FillRectangle(page, _banner.ClientRectangle);
         }
 
-        using (System.Drawing.Drawing2D.GraphicsPath shape = Glyphs.Rounded(new RectangleF(0.5f, 0.5f, _banner.Width - 1.5f, _banner.Height - 1.5f), 6 * _scale))
+        float border = Math.Max(1, (int)Math.Round(_scale));
+        using (System.Drawing.Drawing2D.GraphicsPath shape = Glyphs.Rounded(new RectangleF(border / 2, border / 2, _banner.Width - border - 0.5f, _banner.Height - border - 0.5f), D(4)))
         using (var fill = new SolidBrush(_theme.InfoBar))
+        using (var pen = new Pen(_theme.CardBorder, border))
         {
             g.FillPath(fill, shape);
+            g.DrawPath(pen, shape);
         }
 
         float dot = 10 * _scale;
         using (var red = new SolidBrush(Color.FromArgb(0xE5, 0x39, 0x35)))
         {
-            g.FillEllipse(red, D(16), (_banner.Height - dot) / 2, dot, dot);
+            g.FillEllipse(red, D(19), (_banner.Height - dot) / 2, dot, dot);
         }
 
-        TextRenderer.DrawText(g, "Recording now — changes apply to the next recording", _fonts.Body,
-            new Rectangle(D(36), 0, _banner.Width - D(44), _banner.Height), _theme.Text,
-            TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+        int x = D(40);
+        string strong = "Recording now";
+        int strongWidth = TextRenderer.MeasureText(g, strong, _fonts.Strong, Size.Empty, TextFormatFlags.NoPadding).Width;
+        TextFormatFlags flags = TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+        TextRenderer.DrawText(g, strong, _fonts.Strong, new Rectangle(x, 0, strongWidth + D(2), _banner.Height), _theme.Text, _theme.InfoBar, flags);
+        TextRenderer.DrawText(g, "Changes apply to the next recording", _fonts.Body,
+            new Rectangle(x + strongWidth + D(12), 0, Math.Max(0, _banner.Width - x - strongWidth - D(28)), _banner.Height), _theme.Text, _theme.InfoBar, flags);
+    }
+
+    private void PaintFooter(object? sender, PaintEventArgs e)
+    {
+        using var line = new SolidBrush(_theme.Divider);
+        e.Graphics.FillRectangle(line, 0, 0, _footer.Width, Math.Max(1, (int)Math.Round(_scale)));
     }
 
     private MonitorInfo? SelectedMonitor() =>
         _monitors.FirstOrDefault(m => m.StableId == _monitorId) ?? _monitors.FirstOrDefault(m => m.IsPrimary) ?? _monitors.FirstOrDefault();
 
-    /// <summary>The one-line descriptions: what each setting means right now.</summary>
+    /// <summary>The one-line descriptions: what each setting means right now; and Save only when something changed.</summary>
     private void ShowDetails()
     {
         // Monitor
@@ -625,32 +738,35 @@ internal sealed class SettingsForm : Form
         bool chosenMissing = _monitorId is not null && _monitors.All(m => m.StableId != _monitorId);
         if (chosenMissing)
         {
-            string name = _monitorName is { Length: > 0 } n ? n : "The chosen monitor";
-            _monitorCard.Subtitle = $"{name} is not connected · the main monitor is recorded";
+            _monitorCard.Subtitle = monitor is null ? "Saved monitor not connected" : $"Saved monitor not connected · recording {monitor.Name}";
             _monitorCard.SubtitleColor = _theme.Warning;
+            _monitorCard.GlyphColor = _theme.Warning;
         }
         else
         {
-            _monitorCard.Subtitle = monitor is null ? "No monitor found" : $"{monitor.Name} · {Describe(monitor)}";
+            _monitorCard.Subtitle = monitor is null ? "No monitor found" : Summary(monitor);
             _monitorCard.SubtitleColor = null;
+            _monitorCard.GlyphColor = null;
         }
 
         // Video
         VideoLevel level = RecordingQuality.VideoLevelOf(_videoQuality.Value);
         Size screen = monitor?.Bounds.Size ?? new Size(level.MaxWidth, level.MaxHeight);
         RecordingPreset preset = RecordingQuality.Preset(level.Level, _audioQuality.Value, screen);
-        Size output = preset.OutputSizeFor(screen);
-        _videoCard.Subtitle = string.Create(CultureInfo.InvariantCulture,
-            $"{output.Width} × {output.Height} · {RecordingQuality.FramesPerSecond} fps · up to {RecordingQuality.GigabytesPerHour(preset):0.0} GB per hour");
+        double gigabytes = RecordingQuality.GigabytesPerHour(preset);
+        bool capped = monitor is not null && (monitor.Bounds.Width < level.MaxWidth && monitor.Bounds.Height < level.MaxHeight);
+        _videoCard.Subtitle = capped
+            ? string.Create(CultureInfo.InvariantCulture, $"{monitor!.Name} is {ResolutionName(monitor.Bounds.Size)} · up to {gigabytes:0.0} GB per hour")
+            : string.Create(CultureInfo.InvariantCulture, $"Up to {gigabytes:0.0} GB per hour");
 
         // Folder
-        _folderCard.Subtitle = _folder;
+        ShowFolder(gigabytes);
 
         // Audio quality
         AudioLevel audio = RecordingQuality.AudioLevelOf(_audioQuality.Value);
-        _audioCard.Subtitle = audio.Level == RecordingQuality.DefaultAudioLevel ? $"{audio.Label} · recommended for calls" : audio.Label;
+        _audioCard.Subtitle = audio.Level == RecordingQuality.DefaultAudioLevel ? "Recommended for calls" : "";
 
-        // Controls
+        // Start and stop
         if (_shortcutProblem is { } problem)
         {
             _shortcutCard.Subtitle = problem;
@@ -658,70 +774,113 @@ internal sealed class SettingsForm : Form
         }
         else
         {
-            _shortcutCard.Subtitle = _shortcut.Value.IsEmpty ? "None: use the tray icon to start and stop" : "Press it anywhere to start or stop";
+            _shortcutCard.Subtitle = _shortcut.Value.IsEmpty ? "None · use the tray icon to start and stop" : "Start or stop from any app";
             _shortcutCard.SubtitleColor = null;
         }
 
-        int hours = AppSettings.MaxHoursChoices[Math.Max(0, _maxTime.SelectedIndex)];
-        _stopCard.Subtitle = hours == 0 ? "Records until you stop it" : string.Create(CultureInfo.InvariantCulture, $"Saved and stopped after {hours} hours");
-        _startupCard.Subtitle = _startWithWindows.Checked ? "Waits in the tray, no window" : "Start it from the Start menu";
         if (!_meterTimer.Enabled)
         {
-            ShowDeviceNames();
+            ShowDevicesIdle();
+        }
+
+        _save.Enabled = BuildSettings() != _original;
+    }
+
+    /// <summary>The folder (as "Desktop › EKrecordings"), or why it would not do: missing, or nearly full.</summary>
+    private void ShowFolder(double gigabytesPerHour)
+    {
+        _folderCard.Subtitle = FriendlyPath(_folder);
+        _folderCard.SubtitleColor = null;
+        _tips.SetToolTip(_folderCard, _folder);
+        bool isDefault = string.Equals(_folder, AppPaths.DesktopRecordings, StringComparison.OrdinalIgnoreCase);
+        try
+        {
+            if (!isDefault && !Directory.Exists(_folder))
+            {
+                _folderCard.Subtitle = "Folder not found · choose another one";
+                _folderCard.SubtitleColor = _theme.Error;
+                return;
+            }
+
+            string? root = Path.GetPathRoot(Path.GetFullPath(_folder));
+            if (root is not null && new DriveInfo(root) is { IsReady: true } drive && gigabytesPerHour > 0)
+            {
+                double free = drive.AvailableFreeSpace / 1e9;
+                double hours = free / gigabytesPerHour;
+                if (hours < 3)
+                {
+                    _folderCard.Subtitle = string.Create(CultureInfo.InvariantCulture, $"Only {free:0} GB free · about {Math.Max(0, hours):0.#} hours at this quality");
+                    _folderCard.SubtitleColor = _theme.Warning;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // The folder's drive cannot be read now; the folder is shown as it is.
         }
     }
 
-    /// <summary>Without the preview: the chosen devices' names.</summary>
-    private void ShowDeviceNames()
+    /// <summary>Without the preview: the meters are empty and say nothing yet.</summary>
+    private void ShowDevicesIdle()
     {
-        _micCard.Subtitle = DeviceText(_microphone, "Windows' default microphone");
-        _micCard.SubtitleColor = null;
-        _outputCard.Subtitle = DeviceText(_output, "What Windows plays on its default speakers or headset");
-        _outputCard.SubtitleColor = null;
+        _micMeter.Active = false;
+        _outputMeter.Active = false;
+        _micStatus.Show("");
+        _outputStatus.Show("");
+        _micCard.GlyphColor = null;
+    }
+
+    private AudioSettingsChoice Choice()
+    {
+        var microphone = _microphone.SelectedItem as DeviceChoice;
+        var output = _output.SelectedItem as DeviceChoice;
+        return new AudioSettingsChoice(microphone?.Id, microphone?.Id is null ? null : microphone.Name, output?.Id, output?.Id is null ? null : output.Name);
     }
 
     private AudioSelection Selection()
     {
-        var microphone = _microphone.SelectedItem as DeviceChoice;
-        var output = _output.SelectedItem as DeviceChoice;
-        return new AudioSelection(microphone?.Id, microphone?.Id is null ? null : microphone.Name, output?.Id, output?.Id is null ? null : output.Name);
+        AudioSettingsChoice choice = Choice();
+        return new AudioSelection(choice.MicrophoneId, choice.MicrophoneName, choice.OutputId, choice.OutputName);
     }
 
     private void DevicesChanged()
     {
+        _micHeard = false;
+        _micMuted = null;
+        _nextMuteCheck = 0;
         if (_meterTimer.Enabled)
         {
             _preview.Show(Selection());
         }
-        else
-        {
-            ShowDeviceNames();
-        }
+
+        ShowDetails();
     }
 
     private void StartPreview()
     {
-        if (!Visible || WindowState == FormWindowState.Minimized)
+        if (IsDisposed || !Visible || WindowState == FormWindowState.Minimized || _meterTimer.Enabled)
         {
             return;
         }
 
+        _micHeard = false;
         _preview.Show(Selection());
-        _micMeter.Active = true;
-        _outputMeter.Active = true;
         _meterTimer.Start();
     }
 
     private void StopPreview()
     {
+        if (!_meterTimer.Enabled)
+        {
+            return;
+        }
+
         _meterTimer.Stop();
         _preview.Close();
-        _micMeter.Active = false;
-        _outputMeter.Active = false;
-        ShowDeviceNames();
+        ShowDevicesIdle();
     }
 
-    /// <summary>About 30 times a second: the meters, and which device is in use (or why none is).</summary>
+    /// <summary>About 30 times a second: the meters, and what each input is doing (or why it is not).</summary>
     private void ShowLevels()
     {
         if (_preview.Snapshot() is not { } levels)
@@ -729,26 +888,105 @@ internal sealed class SettingsForm : Form
             return;
         }
 
-        ShowInput(_micCard, _micMeter, levels.Microphone, isMicrophone: true);
-        ShowInput(_outputCard, _outputMeter, levels.Computer, isMicrophone: false);
+        CheckMuteSoon();
+        ShowMicrophone(levels.Microphone);
+        ShowOutput(levels.Computer);
     }
 
-    private void ShowInput(Card card, LevelMeter meter, AudioInputStatus status, bool isMicrophone)
+    private void ShowMicrophone(AudioInputStatus status)
     {
-        meter.Active = status.State is InputState.Running or InputState.Fallback;
-        meter.Push(status.Level);
-        string devices = status.Devices;
-        (string text, Color? color) = status.State switch
+        bool capturing = status.State is InputState.Running or InputState.Fallback;
+        _micHeard |= capturing && status.Level >= HeardLevel;
+        (string text, Color? color, string glyph, string link) = status.State switch
         {
-            InputState.Running when isMicrophone && status.Warning is not null => ("No sound at all · muted, or blocked in Windows privacy settings?", _theme.Warning),
-            InputState.Running => (devices, null),
-            InputState.Fallback => ($"Not connected · using {devices}", _theme.Warning),
-            InputState.NoDevice => (isMicrophone ? "No microphone found" : "No speakers or headset found", _theme.Warning),
-            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning),
-            _ => ("Connecting…", (Color?)null),
+            InputState.Running or InputState.Fallback when _micMuted == true => ("Muted in Windows", _theme.Error, "", "Unmute"),
+            InputState.Running or InputState.Fallback when status.Warning is not null && !_micHeard => ("No sound · check the mic's mute switch", _theme.Warning, "", ""),
+            InputState.Fallback => ("Not connected · Windows default is used", _theme.Warning, "", ""),
+            InputState.Running when _micHeard => ("Working", _theme.Success, Glyphs.CheckMark, ""),
+            InputState.Running => ("Speak to test", (Color?)null, "", ""),
+            InputState.NoDevice => ("No microphone found", _theme.Warning, "", ""),
+            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, "", ""),
+            _ => ("Connecting…", (Color?)null, "", ""),
         };
-        card.Subtitle = text;
-        card.SubtitleColor = color;
+        ShowInput(_micCard, _micMeter, _micStatus, status, capturing && _micMuted != true, text, color, glyph, link);
+        _micCard.GlyphColor = _micMuted == true || status.State is InputState.NoDevice or InputState.Lost or InputState.Retrying ? color : null;
+        _micCard.Glyph = _micMuted == true ? Glyphs.MicrophoneOff : Glyphs.Microphone;
+    }
+
+    private void ShowOutput(AudioInputStatus status)
+    {
+        bool capturing = status.State is InputState.Running or InputState.Fallback;
+        long now = Environment.TickCount64;
+        if (capturing && status.Level >= PlayingLevel)
+        {
+            _outputHeardAt = now;
+        }
+
+        bool playing = _outputHeardAt > 0 && now - _outputHeardAt < 1500;
+        (string text, Color? color, string glyph) = status.State switch
+        {
+            InputState.Fallback => ("Not connected · Windows default is used", _theme.Warning, ""),
+            InputState.Running when playing => ("Working", _theme.Success, Glyphs.CheckMark),
+            InputState.Running => ("Nothing playing", (Color?)null, ""),
+            InputState.NoDevice => ("No speakers or headset found", _theme.Warning, ""),
+            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, ""),
+            _ => ("Connecting…", (Color?)null, ""),
+        };
+        ShowInput(_outputCard, _outputMeter, _outputStatus, status, capturing, text, color, glyph, "");
+    }
+
+    /// <summary>The meter and status of one input; without a working device the status takes the whole line.</summary>
+    private void ShowInput(Card card, LevelMeter meter, StatusLine status, AudioInputStatus input, bool showMeter, string text, Color? color, string glyph, string link)
+    {
+        if (meter.Visible != showMeter)
+        {
+            meter.Visible = showMeter;
+            status.Left = showMeter ? meter.Right + D(12) : card.TextLeft;
+            status.Width = card.Width - D(16) - status.Left;
+        }
+
+        meter.Active = showMeter;
+        meter.Push(input.Level);
+        status.Show(text, color, glyph, link);
+    }
+
+    /// <summary>Once a second, off the window thread: is the microphone muted in Windows?</summary>
+    private void CheckMuteSoon()
+    {
+        long now = Environment.TickCount64;
+        if (_muteCheckRunning || now < _nextMuteCheck)
+        {
+            return;
+        }
+
+        _muteCheckRunning = true;
+        _nextMuteCheck = now + 1000;
+        string? id = Choice().MicrophoneId;
+        _ = Task.Run(() => CoreAudio.IsMicrophoneMuted(id)).ContinueWith(
+            t =>
+            {
+                _muteCheckRunning = false;
+                if (!IsDisposed && Choice().MicrophoneId == id)
+                {
+                    _micMuted = t.IsCompletedSuccessfully ? t.Result : null;
+                }
+            },
+            TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    private void Unmute()
+    {
+        string? id = Choice().MicrophoneId;
+        _ = Task.Run(() => CoreAudio.UnmuteMicrophone(id)).ContinueWith(
+            t =>
+            {
+                if (!IsDisposed)
+                {
+                    _micMuted = t.IsCompletedSuccessfully && t.Result ? false : _micMuted;
+                    _nextMuteCheck = 0;
+                }
+            },
+            TaskScheduler.FromCurrentSynchronizationContext());
     }
 
     /// <summary>A short two-note chime on Windows' default output, so the computer-audio meter can be seen moving.</summary>
@@ -803,6 +1041,28 @@ internal sealed class SettingsForm : Form
         return problem is null;
     }
 
+    /// <summary>The settings as the window shows them now.</summary>
+    private AppSettings BuildSettings()
+    {
+        string folder = _folder.Trim();
+        AudioSettingsChoice audio = Choice();
+        return _original with
+        {
+            MonitorId = _monitorId,
+            MonitorName = _monitorName,
+            VideoQuality = _videoQuality.Value,
+            AudioQuality = _audioQuality.Value,
+            RecordingFolder = string.Equals(folder, AppPaths.DesktopRecordings, StringComparison.OrdinalIgnoreCase) ? null : folder,
+            MicrophoneId = audio.MicrophoneId,
+            MicrophoneName = audio.MicrophoneName,
+            OutputId = audio.OutputId,
+            OutputName = audio.OutputName,
+            Shortcut = _shortcut.Value.ToSetting(),
+            MaxRecordingHours = AppSettings.MaxHoursChoices[Math.Max(0, _maxTime.SelectedIndex)],
+            StartWithWindows = _startWithWindows.Checked,
+        };
+    }
+
     private void Save()
     {
         if (!CheckShortcut())
@@ -812,26 +1072,7 @@ internal sealed class SettingsForm : Form
             return;
         }
 
-        string folder = _folder.Trim();
-        var microphone = _microphone.SelectedItem as DeviceChoice;
-        var output = _output.SelectedItem as DeviceChoice;
-        AppSettings updated = _original with
-        {
-            MonitorId = _monitorId,
-            MonitorName = _monitorName,
-            VideoQuality = _videoQuality.Value,
-            AudioQuality = _audioQuality.Value,
-            RecordingFolder = string.Equals(folder, AppPaths.DesktopRecordings, StringComparison.OrdinalIgnoreCase) ? null : folder,
-            MicrophoneId = microphone?.Id,
-            MicrophoneName = microphone?.Id is null ? null : microphone.Name,
-            OutputId = output?.Id,
-            OutputName = output?.Id is null ? null : output.Name,
-            Shortcut = _shortcut.Value.ToSetting(),
-            MaxRecordingHours = AppSettings.MaxHoursChoices[Math.Max(0, _maxTime.SelectedIndex)],
-            StartWithWindows = _startWithWindows.Checked,
-        };
-
-        string? problem = _apply(updated);
+        string? problem = _apply(BuildSettings());
         if (problem is not null)
         {
             MessageBox.Show(this, problem, "EKrecorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -840,6 +1081,9 @@ internal sealed class SettingsForm : Form
 
         Close();
     }
+
+    /// <summary>The devices chosen in the window.</summary>
+    private sealed record AudioSettingsChoice(string? MicrophoneId, string? MicrophoneName, string? OutputId, string? OutputName);
 
     /// <summary>An entry in a device list: Windows' default (no id) or a specific device.</summary>
     private sealed record DeviceChoice(string? Id, string Name, bool? Connected = true)

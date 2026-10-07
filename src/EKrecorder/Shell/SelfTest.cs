@@ -305,19 +305,24 @@ internal sealed class SelfTest : ApplicationContext
         }
     }
 
-    /// <summary>The Settings window as a picture, with this machine's monitors and devices, and a check of its layout.</summary>
+    /// <summary>
+    /// The Settings window as a picture, and a check of its layout at the usual Windows scales. It shows two monitors
+    /// as on the owner's desk (a 1080p monitor beside a 4K main one), whatever the build machine has, so the picture
+    /// shows the monitor picker; the sound devices are this machine's.
+    /// </summary>
     private async Task ScreenshotAsync()
     {
-        IReadOnlyList<MonitorInfo> monitors = MonitorEnumerator.GetMonitors();
+        MonitorInfo[] monitors =
+        [
+            new(1, IntPtr.Zero, @"\\.\DISPLAY2", new Rectangle(-1920, 1080, 1920, 1080), new Rectangle(-1920, 1080, 1920, 1032), false, 96, "PHL 243V7", "test-monitor-1"),
+            new(2, IntPtr.Zero, @"\\.\DISPLAY1", new Rectangle(0, 0, 3840, 2160), new Rectangle(0, 0, 3840, 2064), true, 192, "LS32D80xU", "test-monitor-2"),
+        ];
         using var window = new MessageWindow();
         using var hotkeys = new HotkeyManager(window.Handle);
-        var settings = new AppSettings { MonitorId = monitors.FirstOrDefault()?.StableId, MonitorName = monitors.FirstOrDefault()?.FriendlyName };
+        var settings = new AppSettings { MonitorId = "test-monitor-2", MonitorName = "LS32D80xU" };
         using var form = new SettingsForm(settings, monitors, hotkeys, _ => null, _ => { });
-        if (_scale is { } scale)
-        {
-            form.ForceScale(scale);
-        }
-
+        float scale = _scale ?? form.DeviceDpi / 96f;
+        form.ForceScale(scale);
         form.StartPosition = FormStartPosition.Manual;
         form.Location = new Point(20, 20);
         form.Show();
@@ -325,16 +330,26 @@ internal sealed class SelfTest : ApplicationContext
         await Task.Delay(1500); // the audio preview has looked for devices by now
         form.Activate();
         await Task.Delay(300);
-        using Bitmap bitmap = form.RenderContent();
-        Directory.CreateDirectory(_output);
-        string png = Path.Combine(_output, "settings.png");
-        bitmap.Save(png, ImageFormat.Png);
-        File.WriteAllText(Path.Combine(_output, "settings.png.base64.txt"), Convert.ToBase64String(File.ReadAllBytes(png)));
-        IReadOnlyList<string> problems = form.CheckLayout();
-        Result(
-            Invariant($"Settings window laid out at {(_scale ?? form.DeviceDpi / 96f) * 100:0} %"),
-            problems.Count == 0,
-            problems.Count == 0 ? Invariant($"{bitmap.Width}x{bitmap.Height}, nothing cut off or overlapping") : string.Join("; ", problems));
+        using (Bitmap bitmap = form.RenderContent())
+        {
+            Directory.CreateDirectory(_output);
+            string png = Path.Combine(_output, "settings.png");
+            bitmap.Save(png, ImageFormat.Png);
+            File.WriteAllText(Path.Combine(_output, "settings.png.base64.txt"), Convert.ToBase64String(File.ReadAllBytes(png)));
+            Log.Info(Invariant($"Settings window picture: {bitmap.Width}x{bitmap.Height} at {scale * 100:0} %"));
+        }
+
+        // Every usual scale, and with the "recording now" bar: nothing cut off, outside its card or overlapping.
+        foreach (float check in new[] { 1f, 1.25f, 1.5f, 1.75f, 2f, 2.25f })
+        {
+            form.ForceScale(check);
+            IReadOnlyList<string> problems = form.CheckLayout();
+            Result(Invariant($"Settings window laid out at {check * 100:0} %"), problems.Count == 0, problems.Count == 0 ? "nothing cut off or overlapping" : string.Join("; ", problems));
+        }
+
+        form.SetRecording(true);
+        IReadOnlyList<string> recording = form.CheckLayout();
+        Result("Settings window laid out while recording (at 225 %)", recording.Count == 0, recording.Count == 0 ? "nothing cut off or overlapping" : string.Join("; ", recording));
         form.Close();
     }
 

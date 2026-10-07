@@ -27,6 +27,7 @@ internal static class AppNative
     public const uint ES_SYSTEM_REQUIRED = 0x00000001;
 
     public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    public const int DWMWA_CAPTION_COLOR = 35;
 
     public const int ASFW_ANY = -1;
 

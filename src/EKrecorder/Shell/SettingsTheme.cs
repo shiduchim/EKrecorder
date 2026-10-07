@@ -10,51 +10,104 @@ namespace EKrecorder.Shell;
 /// </summary>
 internal sealed class UiTheme
 {
-    private UiTheme(bool dark, Color accent)
+    private UiTheme(bool dark, bool highContrast, Color accent)
     {
         Dark = dark;
+        HighContrast = highContrast;
         Accent = accent;
-        if (dark)
+        if (highContrast)
+        {
+            // Windows' high-contrast colours, as every other app uses them.
+            Page = SystemColors.Window;
+            Card = SystemColors.Window;
+            CardBorder = SystemColors.WindowText;
+            Divider = SystemColors.WindowText;
+            Text = SystemColors.WindowText;
+            SecondaryText = SystemColors.WindowText;
+            DisabledText = SystemColors.GrayText;
+            Control = SystemColors.ButtonFace;
+            ControlHover = SystemColors.ButtonFace;
+            ControlPressed = SystemColors.ButtonFace;
+            ControlBorder = SystemColors.WindowText;
+            Rail = SystemColors.WindowText;
+            Track = SystemColors.ButtonFace;
+            Accent = SystemColors.Highlight;
+            AccentText = SystemColors.HighlightText;
+            Link = SystemColors.HotTrack;
+            Success = SystemColors.WindowText;
+            Warning = SystemColors.WindowText;
+            Error = SystemColors.WindowText;
+            InfoBar = SystemColors.Window;
+            MonitorFill = SystemColors.ButtonFace;
+            MonitorBorder = SystemColors.WindowText;
+        }
+        else if (dark)
         {
             Page = Hex(0x202020);
             Card = Hex(0x2B2B2B);
             CardBorder = Hex(0x1D1D1D);
+            Divider = Hex(0x323232);
             Text = Hex(0xFFFFFF);
-            SecondaryText = Hex(0xC5C5C5);
+            SecondaryText = Hex(0xCFCFCF);
             DisabledText = Hex(0x787878);
-            Control = Hex(0x373737);
-            ControlHover = Hex(0x3C3C3C);
-            ControlPressed = Hex(0x323232);
-            ControlBorder = Hex(0x444444);
-            Rail = Hex(0x9A9A9A);
+            Control = Hex(0x2D2D2D);
+            ControlHover = Hex(0x323232);
+            ControlPressed = Hex(0x272727);
+            ControlBorder = Hex(0x3A3A3A);
+            Rail = Hex(0x9F9F9F);
             Track = Hex(0x454545);
             AccentText = Hex(0x000000);
+            Link = Hex(0x99EBFF);
+            Success = Hex(0x6CCB5F);
             Warning = Hex(0xFCE100);
             Error = Hex(0xFF99A4);
-            InfoBar = Hex(0x442726);
+            InfoBar = Hex(0x272727);
+            MonitorFill = Hex(0x3A3A3A);
+            MonitorBorder = Hex(0x5C5C5C);
         }
         else
         {
             Page = Hex(0xF3F3F3);
             Card = Hex(0xFBFBFB);
             CardBorder = Hex(0xE5E5E5);
-            Text = Hex(0x1A1A1A);
+            Divider = Hex(0xE5E5E5);
+            Text = Hex(0x1B1B1B);
             SecondaryText = Hex(0x5F5F5F);
             DisabledText = Hex(0xA0A0A0);
-            Control = Hex(0xFDFDFD);
+            Control = Hex(0xFBFBFB);
             ControlHover = Hex(0xF6F6F6);
-            ControlPressed = Hex(0xF0F0F0);
+            ControlPressed = Hex(0xF5F5F5);
             ControlBorder = Hex(0xD6D6D6);
-            Rail = Hex(0x8A8A8A);
+            Rail = Hex(0x8B8B8B);
             Track = Hex(0xE0E0E0);
             AccentText = Hex(0xFFFFFF);
+            Link = Hex(0x003E92);
+            Success = Hex(0x0F7B0F);
             Warning = Hex(0x9D5D00);
             Error = Hex(0xC42B1C);
-            InfoBar = Hex(0xFDE7E9);
+            InfoBar = Hex(0xF5F5F5);
+            MonitorFill = Hex(0xE8E8E8);
+            MonitorBorder = Hex(0xBDBDBD);
         }
     }
 
     public bool Dark { get; }
+
+    /// <summary>Windows' high-contrast mode is on: its system colours are used.</summary>
+    public bool HighContrast { get; }
+
+    /// <summary>The line above the Save and Cancel buttons.</summary>
+    public Color Divider { get; }
+
+    public Color Link { get; }
+
+    /// <summary>"Working" and the level meters (never the accent colour: an orange or red accent would look like a warning).</summary>
+    public Color Success { get; }
+
+    /// <summary>A monitor in the picture that is not chosen.</summary>
+    public Color MonitorFill { get; }
+
+    public Color MonitorBorder { get; }
 
     public Color Page { get; }
 
@@ -99,7 +152,7 @@ internal sealed class UiTheme
     public static UiTheme Current()
     {
         bool dark = Application.IsDarkModeEnabled;
-        return new UiTheme(dark, AccentColor(dark));
+        return new UiTheme(dark, SystemInformation.HighContrast, AccentColor(dark));
     }
 
     /// <summary>A mix of two colours (<paramref name="amountOfA"/> of the first).</summary>
@@ -186,17 +239,19 @@ internal sealed class UiFonts : IDisposable
 /// <summary>Icons from Windows' own icon font (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10).</summary>
 internal static class Glyphs
 {
-    public const string Monitor = "";
-    public const string Video = "";
-    public const string Folder = "";
-    public const string Microphone = "";
-    public const string Speaker = "";
-    public const string Equalizer = "";
-    public const string Keyboard = "";
-    public const string Timer = "";
-    public const string Power = "";
-    public const string Play = "";
-    public const string Warning = "";
+    public const string Monitor = "\uE7F4";
+    public const string Video = "\uE714";
+    public const string Folder = "\uE8B7";
+    public const string Microphone = "\uE720";
+    public const string Speaker = "\uE767";
+    public const string Equalizer = "\uE9E9";
+    public const string Keyboard = "\uE765";
+    public const string Timer = "\uE916";
+    public const string Power = "\uE7E8";
+    public const string Play = "\uE768";
+    public const string Warning = "\uE7BA";
+    public const string CheckMark = "\uE73E";
+    public const string MicrophoneOff = "\uEC54";
 
     private static readonly Dictionary<int, Font> Fonts = new();
     private static string? _family;
@@ -218,7 +273,7 @@ internal static class Glyphs
     }
 
     /// <summary>Draws <paramref name="glyph"/> centred in <paramref name="box"/>, <paramref name="pixels"/> high.</summary>
-    public static void Draw(Graphics g, string glyph, Rectangle box, Color color, float pixels)
+    public static void Draw(Graphics g, string glyph, Rectangle box, Color color, float pixels, Color? back = null)
     {
         if (Family is not { } family)
         {
@@ -232,7 +287,16 @@ internal static class Glyphs
             Fonts[key] = font;
         }
 
-        TextRenderer.DrawText(g, glyph, font, box, color, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+        if (back is { } background)
+        {
+            // With the background colour ClearType edges blend into it instead of turning dark.
+            TextRenderer.DrawText(g, glyph, font, box, color, background, flags);
+        }
+        else
+        {
+            TextRenderer.DrawText(g, glyph, font, box, color, flags);
+        }
     }
 
     public static GraphicsPath Rounded(RectangleF bounds, float radius) => AppIcons.RoundedRectangle(bounds, radius);

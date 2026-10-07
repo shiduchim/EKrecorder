@@ -212,6 +212,115 @@ internal static unsafe class CoreAudio
         return devices;
     }
 
+    /// <summary>
+    /// Windows' defaults by name, for the Settings window: the microphone a recording uses with "Windows default"
+    /// (the communications microphone, else the default one) and the outputs it records (default playback and
+    /// default communications, once each).
+    /// </summary>
+    public static (string? Microphone, IReadOnlyList<string> Outputs) DefaultNames()
+    {
+        bool uninitialize = EnterMta();
+        IMMDeviceEnumerator* enumerator = null;
+        try
+        {
+            enumerator = CreateEnumerator();
+            string? microphoneId = DefaultMicrophoneId(enumerator);
+            string? microphone = microphoneId is null ? null : NameOf(enumerator, microphoneId);
+            var outputs = new List<string>();
+            foreach (ERole role in new[] { ERole.eConsole, ERole.eCommunications })
+            {
+                if (DefaultEndpointId(enumerator, EDataFlow.eRender, role) is { } id && NameOf(enumerator, id) is { } name && !outputs.Contains(name))
+                {
+                    outputs.Add(name);
+                }
+            }
+
+            return (microphone, outputs);
+        }
+        catch (AudioException ex)
+        {
+            Log.Warn($"Reading Windows' default audio devices: {ex.Message}");
+            return (null, []);
+        }
+        finally
+        {
+            if (enumerator != null)
+            {
+                enumerator->Release();
+            }
+
+            if (uninitialize)
+            {
+                CoUninitialize();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the microphone <paramref name="id"/> (null: the one "Windows default" records) is muted in Windows,
+    /// or null when that cannot be told. Reading this does not open the microphone.
+    /// </summary>
+    public static bool? IsMicrophoneMuted(string? id) => MicrophoneMute(id, unmute: false);
+
+    /// <summary>Unmutes the microphone in Windows. True when that worked.</summary>
+    public static bool UnmuteMicrophone(string? id) => MicrophoneMute(id, unmute: true) == false;
+
+    private static bool? MicrophoneMute(string? id, bool unmute)
+    {
+        bool uninitialize = EnterMta();
+        IMMDeviceEnumerator* enumerator = null;
+        IMMDevice* device = null;
+        IAudioEndpointVolume* volume = null;
+        try
+        {
+            enumerator = CreateEnumerator();
+            string? deviceId = id ?? DefaultMicrophoneId(enumerator);
+            device = deviceId is null ? null : OpenDevice(enumerator, deviceId);
+            if (device == null || device->Activate(__uuidof<IAudioEndpointVolume>(), ClsctxAll, null, (void**)&volume).FAILED || volume == null)
+            {
+                return null;
+            }
+
+            if (unmute && volume->SetMute(FALSE, null).FAILED)
+            {
+                return null;
+            }
+
+            BOOL muted;
+            return volume->GetMute(&muted).SUCCEEDED ? muted != FALSE : null;
+        }
+        catch (AudioException)
+        {
+            return null;
+        }
+        finally
+        {
+            if (volume != null)
+            {
+                volume->Release();
+            }
+
+            if (device != null)
+            {
+                device->Release();
+            }
+
+            if (enumerator != null)
+            {
+                enumerator->Release();
+            }
+
+            if (uninitialize)
+            {
+                CoUninitialize();
+            }
+        }
+    }
+
+    /// <summary>The microphone "Windows default" records: the communications microphone, else the default one.</summary>
+    private static string? DefaultMicrophoneId(IMMDeviceEnumerator* enumerator) =>
+        DefaultEndpointId(enumerator, EDataFlow.eCapture, ERole.eCommunications) ?? DefaultEndpointId(enumerator, EDataFlow.eCapture, ERole.eConsole);
+
     /// <summary>The endpoint, or null when it does not exist (AddRef'ed; release it).</summary>
     public static IMMDevice* OpenDevice(IMMDeviceEnumerator* enumerator, string id)
     {
