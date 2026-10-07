@@ -118,8 +118,8 @@ internal sealed class SettingsForm : Form
         _videoSize = Secondary("");
         AddRow(recording, "Video quality", Stack(_videoQuality, _videoDetail, _videoSize));
 
-        _folder = new TextBox { ReadOnly = true, Width = FieldWidth - 90, Margin = new Padding(0, 1, 6, 0), TabStop = false };
         var browse = new Button { Text = "Browse…", AutoSize = true, Margin = new Padding(0) };
+        _folder = new TextBox { ReadOnly = true, Width = FieldWidth - browse.PreferredSize.Width - 6, Margin = new Padding(0, 1, 6, 0), TabStop = false };
         browse.Click += (_, _) => ChooseFolder();
         var folderRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
         folderRow.Controls.AddRange([_folder, browse]);
