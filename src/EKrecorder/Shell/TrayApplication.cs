@@ -343,6 +343,11 @@ internal sealed class TrayApplication : ApplicationContext
                     ? new Notice("Recording saved", $"{Path.GetFileName(path)} (finished after Windows restarted).", NoticeKind.Info, path)
                     : new Notice("Recording recovered after a problem", Path.GetFileName(path), NoticeKind.Info, path));
             }
+            else if (finished.Path is { } stuck && string.Equals(Path.GetDirectoryName(stuck), _paths.InProgress, StringComparison.OrdinalIgnoreCase))
+            {
+                // Still in InProgress (it could not be finished or moved yet): tried again at the next start.
+                ShowNotice(new Notice("A recording is not saved yet", "EKrecorder will try again the next time it starts. The recording log contains more information.", NoticeKind.Warning, _paths.InProgress));
+            }
             else if (!finished.Playable && leftover.Length > 1024 * 1024)
             {
                 ShowNotice(new Notice("A recording could not be recovered", "EKrecorder kept the file. The recording log contains more information.", NoticeKind.Warning, _paths.Unrecoverable));

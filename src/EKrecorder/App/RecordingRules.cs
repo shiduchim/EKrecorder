@@ -128,6 +128,9 @@ internal sealed record RecordingJournal
 
     public string? Quality { get; init; }
 
+    /// <summary>Starts at which finishing this recording was tried and did not complete.</summary>
+    public int FinishAttempts { get; init; }
+
     public static string PathFor(string recordingPath) => recordingPath + ".json";
 
     public static RecordingJournal? TryRead(string recordingPath)

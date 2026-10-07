@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using EKrecorder.App;
 using EKrecorder.Diagnostics;
 using EKrecorder.Mp4;
@@ -21,18 +22,23 @@ internal static class RecordingFinisher
 {
     public static FinishedFile Finish(string temporaryPath, string finalName, IReadOnlyList<string> folders, string unrecoverableFolder)
     {
-        Log.Info($"Finishing {temporaryPath} -> {finalName}");
-        RepairResult repair;
         try
         {
-            repair = Mp4Repair.Run(temporaryPath);
+            return FinishOrThrow(temporaryPath, finalName, folders, unrecoverableFolder);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or OverflowException)
+        catch (Exception ex)
         {
+            // Whatever went wrong, the recording stays where it is (every finishing step can be repeated); the next
+            // start tries again.
             Log.Error($"Finishing {temporaryPath} failed; it stays in place and is tried again at the next start", ex);
             return new FinishedFile(false, temporaryPath, $"the file could not be finished: {ex.Message}", null, null, null);
         }
+    }
 
+    private static FinishedFile FinishOrThrow(string temporaryPath, string finalName, IReadOnlyList<string> folders, string unrecoverableFolder)
+    {
+        Log.Info($"Finishing {temporaryPath} -> {finalName}");
+        RepairResult repair = InUseRetried(() => Mp4Repair.Run(temporaryPath), $"Finishing {temporaryPath}");
         Log.Info($"MP4: {repair.Outcome}: {repair.Detail}");
         foreach (string note in repair.Notes)
         {
@@ -69,6 +75,24 @@ internal static class RecordingFinisher
         RecordingJournal.TryDelete(temporaryPath);
         Log.Info($"Recording saved: {path}");
         return new FinishedFile(true, path, moveProblem, repair, summary, playback);
+    }
+
+    /// <summary>Runs <paramref name="action"/>, trying again for a few seconds while another program (an antivirus scan, a backup) holds the file.</summary>
+    private static T InUseRetried<T>(Func<T> action, string what)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return action();
+            }
+            catch (IOException ex) when (attempt < 4 && (ex.HResult & 0xFFFF) is 32 or 33)
+            {
+                // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+                Log.Warn($"{what}: the file is in use ({ex.Message}); trying again in {attempt} s");
+                Thread.Sleep(TimeSpan.FromSeconds(attempt));
+            }
+        }
     }
 
     public static string Describe(Mp4Summary summary)
@@ -115,8 +139,8 @@ internal static class RecordingFinisher
 
     /// <summary>
     /// A rename on the same drive. To another drive (or a network folder) it is copied as "name.partial", flushed,
-    /// checked, renamed, and only then is the original deleted: an interruption never leaves a half file under the
-    /// real name, and never loses the original.
+    /// checked, renamed (the rename itself written through to the disk), and only then is the original deleted: an
+    /// interruption never leaves a half file under the real name, and never loses the original.
     /// </summary>
     private static void MoveFile(string source, string target)
     {
@@ -129,25 +153,75 @@ internal static class RecordingFinisher
         }
 
         string partial = target + ".partial";
-        using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan))
-        using (var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+        try
         {
-            input.CopyTo(output, 1 << 20);
-            output.Flush(flushToDisk: true);
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan))
+            using (var output = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+            {
+                input.CopyTo(output, 1 << 20);
+                output.Flush(flushToDisk: true);
+            }
+
+            if (new FileInfo(partial).Length != new FileInfo(source).Length)
+            {
+                throw new IOException("the copy is not complete");
+            }
+
+            if (!MoveFileEx(partial, target, MoveFileWriteThrough))
+            {
+                throw new IOException($"renaming the copy failed (error {Marshal.GetLastPInvokeError()})");
+            }
+        }
+        catch
+        {
+            // A half copy (disk full, the network went away) is not left in the user's folder.
+            TryDeleteQuietly(partial);
+            throw;
         }
 
-        if (new FileInfo(partial).Length != new FileInfo(source).Length)
+        try
         {
-            File.Delete(partial);
-            throw new IOException("the copy is not complete");
+            File.Delete(source);
         }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The recording is safely in its folder; the original is only in the way. It is renamed so the next start
+            // does not take it for an unfinished recording, and removed then.
+            Log.Warn($"The recording was copied to {target}, but the original could not be deleted ({ex.Message}).");
+            try
+            {
+                File.Move(source, source + SavedCopySuffix);
+            }
+            catch (Exception rename) when (rename is IOException or UnauthorizedAccessException)
+            {
+                Log.Warn($"Renaming the original failed too ({rename.Message}); it may be saved again at the next start.");
+            }
+        }
+    }
 
-        File.Move(partial, target);
-        File.Delete(source);
+    /// <summary>The end of the name of an original that was copied to its folder but could not be deleted.</summary>
+    internal const string SavedCopySuffix = ".saved-copy";
+
+    private const uint MoveFileWriteThrough = 0x8;
+
+    [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(string existing, string target, uint flags);
+
+    private static void TryDeleteQuietly(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log.Warn($"Deleting {path} failed: {ex.Message}");
+        }
     }
 
     /// <summary>Keeps a file with nothing playable out of the way, but never deletes it.</summary>
-    private static string? SetAside(string path, string folder)
+    internal static string? SetAside(string path, string folder)
     {
         try
         {
@@ -187,8 +261,10 @@ internal static class RecoveryService
                 found.Add(new Leftover(file, RecordingJournal.TryRead(file), new FileInfo(file).Length));
             }
 
-            // Orphaned journal temp files from a crash while one was written.
-            foreach (string temporary in Directory.EnumerateFiles(paths.InProgress, "*.json.tmp"))
+            // Orphaned journal temp files from a crash while one was written, and originals already copied to
+            // their folder that could not be deleted then.
+            foreach (string temporary in Directory.EnumerateFiles(paths.InProgress, "*.json.tmp")
+                .Concat(Directory.EnumerateFiles(paths.InProgress, "*" + RecordingFinisher.SavedCopySuffix)))
             {
                 File.Delete(temporary);
             }
@@ -215,8 +291,35 @@ internal static class RecoveryService
             name = RecordingNames.Recovered(name);
         }
 
-        Log.Info($"Unfinished recording found: {leftover.Path} ({leftover.Length:N0} bytes, {(journal is null ? "no journal" : $"journal state {journal.State}, started {journal.StartedLocal:yyyy-MM-dd HH:mm:ss}")}).");
+        Log.Info($"Unfinished recording found: {leftover.Path} ({leftover.Length:N0} bytes, {(journal is null ? "no journal" : $"journal state {journal.State}, started {journal.StartedLocal:yyyy-MM-dd HH:mm:ss}, finishing tried {journal.FinishAttempts} time(s) before")}).");
+
+        // A file whose finishing failed at several starts in a row (or took EKrecorder down) is set aside instead
+        // of being tried at every start for ever.
+        int attempts = (journal?.FinishAttempts ?? 0) + 1;
+        if (attempts > MaxFinishAttempts)
+        {
+            string? kept = RecordingFinisher.SetAside(leftover.Path, paths.Unrecoverable);
+            if (kept is not null && kept != leftover.Path)
+            {
+                RecordingJournal.TryDelete(leftover.Path);
+            }
+
+            return new FinishedFile(false, kept, $"finishing it failed {MaxFinishAttempts} times; it was set aside", null, null, null);
+        }
+
+        RecordingJournal counted = (journal ?? new RecordingJournal { FinalName = name, StartedLocal = File.GetLastWriteTime(leftover.Path) })
+            with { FinishAttempts = attempts };
+        counted.TryWrite(leftover.Path);
         string[] folders = [journal?.FinalFolder ?? paths.RecordingsFolder(settings), paths.DefaultRecordings];
-        return RecordingFinisher.Finish(leftover.Path, name, folders, paths.Unrecoverable);
+        FinishedFile finished = RecordingFinisher.Finish(leftover.Path, name, folders, paths.Unrecoverable);
+        if (finished.Repair is not null && File.Exists(leftover.Path))
+        {
+            // Finished but not moved (no folder could take it): that is not a failed attempt.
+            (counted with { FinishAttempts = attempts - 1, State = RecordingJournal.Stopped, FinalName = name }).TryWrite(leftover.Path);
+        }
+
+        return finished;
     }
+
+    private const int MaxFinishAttempts = 3;
 }
