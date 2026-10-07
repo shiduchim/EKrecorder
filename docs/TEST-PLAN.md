@@ -40,10 +40,12 @@ monitor). **On the PC** = needs the real machine. After each test, the recording
 | Monitor reconnect | – | switch the recorded monitor off/on (or unplug it) while recording: triangle orange on the main monitor, then back |
 | Low disk | thresholds (unit tests) | optional: record to a nearly full USB stick folder |
 | App force-closed | killed while recording, recovered at the next start | Task Manager → End task while recording, start EKrecorder again |
-| Power loss / crash | file cut at hundreds of points (unit tests) | optional: hold the power button while recording |
+| Power loss / crash | file cut at hundreds of points; damaged bytes in the middle, a half-written index, zeros at the end (unit tests) | optional: hold the power button while recording |
 | Recordings folder unavailable | – | choose a USB stick folder, unplug it, record: saved in Desktop\EKrecordings |
 | Windows shutdown | – | shut down while recording: file saved at the next start |
 | Sleep | – | sleep while recording: saved on wake-up |
+| Exit while saving | – | stop a long recording and choose Exit at once: the tray icon stays until it is saved |
+| Update while recording | installer asks the running copy to save and exit | run Setup while recording: recording saved, EKrecorder back in the tray |
 
 ## UI
 
@@ -54,6 +56,7 @@ monitor). **On the PC** = needs the real machine. After each test, the recording
 | Start with Windows | Run value set by the installed app | restart Windows: EKrecorder in the tray, no window |
 | Tray menu | – | each item |
 | Settings remembered | save/load, damaged file (unit + self-test) | change everything, Exit, start again |
+| Settings Cancel / Esc | – | change something, press Esc: window closes, nothing changed |
 | No microphone held open while idle | devices open only in a recording | Windows privacy indicator (mic icon) off while idle |
 | No test/debug text | – | look at Settings and the tray menu |
 | Installer | silent install, start, single copy, exit, uninstall | install, use, uninstall: recordings stay |
