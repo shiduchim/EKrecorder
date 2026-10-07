@@ -52,6 +52,8 @@ Name: "{autoprograms}\EKrecorder"; Filename: "{app}\EKrecorder.exe"; Comment: "S
 
 [Run]
 Filename: "{app}\EKrecorder.exe"; Description: "Start EKrecorder now"; Flags: nowait postinstall skipifsilent
+; A silent install (an update) starts it again in the tray, as Windows would at sign-in.
+Filename: "{app}\EKrecorder.exe"; Parameters: "--background"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{app}\EKrecorder.exe"; Parameters: "--exit"; Flags: runhidden waituntilterminated; RunOnceId: "ExitEKrecorder"
@@ -68,7 +70,8 @@ var
 begin
   Result := '';
   ExtractTemporaryFile('EKrecorder-exit.exe');
-  Exec(ExpandConstant('{tmp}\EKrecorder-exit.exe'), '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if Exec(ExpandConstant('{tmp}\EKrecorder-exit.exe'), '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode <> 0) then
+    Result := 'EKrecorder is still saving a recording. Please wait until it is saved, then run Setup again.';
 end;
 
 // Recordings are never touched. Settings and logs go only if the user says so; an unfinished recording in

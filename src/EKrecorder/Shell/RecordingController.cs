@@ -50,6 +50,7 @@ internal sealed class RecordingController : IDisposable
 {
     private static readonly TimeSpan DiskCheckInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan FailureWindow = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(60);
     private const int MaxFailuresInARow = 3;
 
     private readonly AppPaths _paths;
@@ -76,6 +77,10 @@ internal sealed class RecordingController : IDisposable
     private int _fragmentedEarlyFailures;
     private bool _avoidFragmentedOnce;
     private bool _stopping;
+    private bool _closing;
+    private bool _restartPending;
+    private int _maxHours;
+    private RecordingSession? _stoppingSession;
 
     public RecordingController(AppPaths paths, Func<AppSettings> settings)
     {
@@ -96,6 +101,9 @@ internal sealed class RecordingController : IDisposable
     public RecorderState State { get; private set; }
 
     public bool IsRecording => State is RecorderState.Recording or RecorderState.Starting;
+
+    /// <summary>A recording is starting, running or stopping, or one is still being saved.</summary>
+    public bool Busy => State != RecorderState.Idle || Finishing;
 
     public bool NeedsAttention => _attention.NeedsAttention;
 
@@ -119,7 +127,7 @@ internal sealed class RecordingController : IDisposable
 
     public async Task StartAsync(string trigger)
     {
-        if (State != RecorderState.Idle)
+        if (State != RecorderState.Idle || _closing)
         {
             return;
         }
@@ -131,6 +139,7 @@ internal sealed class RecordingController : IDisposable
         {
             AppSettings settings = _settings();
             RecordingPreset preset = RecordingQuality.Preset(settings.VideoQuality, settings.AudioQuality);
+            _maxHours = settings.MaxRecordingHours; // a change in Settings applies to the next recording
             (MonitorInfo? monitor, string? substitute) = ChooseMonitor(settings);
             if (monitor is null)
             {
@@ -230,20 +239,29 @@ internal sealed class RecordingController : IDisposable
         }
 
         _stopping = true;
+        _stoppingSession = session;
         SetState(RecorderState.Stopping);
         _timer.Stop();
         Log.Info($"Stopping the recording: {reason}");
+
+        // Saving is lined up first (it starts once the recording thread has closed the file), so Exit and a Windows
+        // shutdown that come during the stop wait for it.
+        _ = FinishAsync(session, kind);
         try
         {
-            await session.StopAsync(reason);
+            Task stop = session.StopAsync(reason);
+            if (await Task.WhenAny(stop, Task.Delay(StopTimeout)) != stop)
+            {
+                Log.Error($"The recording did not stop within {StopTimeout.TotalSeconds:0} s; it is saved when it does, or recovered at the next start.");
+            }
         }
         catch (Exception ex)
         {
             Log.Error("Stopping the recording failed", ex);
         }
 
-        EndRecording(session, finalized: true);
-        _ = FinishAsync(session, kind);
+        EndRecording(session, finalized: session.FileFinalized);
+        _stoppingSession = null;
         _stopping = false;
         SetState(RecorderState.Idle);
         if (kind == StopKind.Failure)
@@ -254,10 +272,28 @@ internal sealed class RecordingController : IDisposable
 
     /// <summary>
     /// Windows is shutting down or going to sleep: stops the recording right now and waits (at most
-    /// <paramref name="budget"/>) for the file to be finished. Returns true when it was.
+    /// <paramref name="budget"/>) for the file to be finished. Returns true when it was. A recording that is still
+    /// starting is stopped as soon as it has started.
     /// </summary>
     public bool StopNow(string reason, TimeSpan budget, StopKind kind)
     {
+        if (kind == StopKind.Shutdown)
+        {
+            _closing = true;
+        }
+
+        if (State == RecorderState.Starting)
+        {
+            _pendingStop = reason;
+            return false;
+        }
+
+        if (_stoppingSession is { } stopping)
+        {
+            // A stop is already under way: wait for its file (saving follows by itself).
+            return stopping.Completion.Wait(budget);
+        }
+
         if (_session is not { } session)
         {
             return true;
@@ -267,31 +303,32 @@ internal sealed class RecordingController : IDisposable
         _pendingStop = null;
         _timer.Stop();
         Log.Info($"Stopping the recording now: {reason}");
+        _ = FinishAsync(session, kind);
         bool finished = session.StopAsync(reason).Wait(budget);
-        Log.Info(finished ? "The recording file is finished." : "The recording did not finish in time; it is recovered at the next start.");
-        EndRecording(session, finalized: finished);
-        if (kind == StopKind.Sleep)
-        {
-            // Saving goes on in the background (and after waking up, if Windows goes to sleep first).
-            _ = FinishAsync(session, kind);
-        }
-
+        Log.Info(finished ? "The recording file is finished." : "The recording did not finish in time; it is saved when it does (or recovered at the next start).");
+        EndRecording(session, finalized: finished && session.FileFinalized);
         _stopping = false;
         SetState(RecorderState.Idle);
         return finished;
     }
 
-    /// <summary>Stops a running recording and waits until every recording is saved (at most <paramref name="timeout"/>).</summary>
+    /// <summary>
+    /// EKrecorder is closing: no recording starts any more, a running (or starting, or stopping) one is stopped, and
+    /// every recording is saved, waiting at most <paramref name="timeout"/> in all.
+    /// </summary>
     public async Task ShutdownAsync(TimeSpan timeout)
     {
+        _closing = true;
+        DateTime deadline = DateTime.UtcNow + timeout;
         if (State == RecorderState.Starting)
         {
             _pendingStop = "EKrecorder was closed";
-            var waited = DateTime.UtcNow;
-            while (State == RecorderState.Starting && DateTime.UtcNow - waited < TimeSpan.FromSeconds(15))
-            {
-                await Task.Delay(100);
-            }
+        }
+
+        // A start or a stop under way ends first (a start then stops at once).
+        while (State is RecorderState.Starting or RecorderState.Stopping && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
         }
 
         if (State == RecorderState.Recording)
@@ -300,7 +337,8 @@ internal sealed class RecordingController : IDisposable
         }
 
         Task all = Task.WhenAll(_finishing.ToArray());
-        if (await Task.WhenAny(all, Task.Delay(timeout)) != all)
+        TimeSpan left = deadline - DateTime.UtcNow;
+        if (left <= TimeSpan.Zero || await Task.WhenAny(all, Task.Delay(left)) != all)
         {
             Log.Warn("Saving the last recording did not finish in time; it is finished at the next start.");
         }
@@ -399,8 +437,15 @@ internal sealed class RecordingController : IDisposable
         string[] folders = [journal.FinalFolder ?? _paths.RecordingsFolder(_settings()), _paths.DefaultRecordings];
         string reports = _paths.Reports;
         string unrecoverable = _paths.Unrecoverable;
-        Task<FinishedFile> work = Task.Run(() =>
+        Task<FinishedFile> work = Task.Run(async () =>
         {
+            // Only once the recording thread has closed the file (a sleep or a slow stop can come back much later).
+            await session.Completion.ConfigureAwait(false);
+            if (session.FileFinalized && File.Exists(session.TemporaryPath))
+            {
+                (journal with { State = RecordingJournal.Stopped }).TryWrite(session.TemporaryPath);
+            }
+
             FinishedFile finished = File.Exists(session.TemporaryPath)
                 ? RecordingFinisher.Finish(session.TemporaryPath, journal.FinalName, folders, unrecoverable)
                 : new FinishedFile(false, null, "nothing was recorded", null, null, null);
@@ -445,7 +490,11 @@ internal sealed class RecordingController : IDisposable
             StopKind.Exit or StopKind.Shutdown => null,
             StopKind.MaxTime => new Notice("Recording stopped and saved", $"The maximum recording time was reached. {where}", NoticeKind.Info, finished.Path),
             StopKind.DiskFull => new Notice("Recording stopped and saved", $"The disk is almost full. {where}", NoticeKind.Warning, finished.Path),
-            StopKind.Failure => new Notice("Recording saved after a problem", $"{where}. A new recording was started.", NoticeKind.Warning, finished.Path),
+            StopKind.Failure => new Notice(
+                "Recording saved after a problem",
+                _restartPending || IsRecording ? $"{where}. A new recording was started." : where,
+                NoticeKind.Warning,
+                finished.Path),
             StopKind.Sleep => new Notice("Recording saved", $"The PC went to sleep. {where}", NoticeKind.Info, finished.Path),
             _ => new Notice("Recording saved", where, finished.Problem is null ? NoticeKind.Info : NoticeKind.Warning, finished.Path),
         };
@@ -478,10 +527,23 @@ internal sealed class RecordingController : IDisposable
             return;
         }
 
-        await Task.Delay(1000);
-        if (State == RecorderState.Idle)
+        if (_closing)
         {
-            await StartAsync("restart after a problem");
+            return;
+        }
+
+        _restartPending = true;
+        try
+        {
+            await Task.Delay(1000);
+            if (State == RecorderState.Idle && !_closing)
+            {
+                await StartAsync("restart after a problem");
+            }
+        }
+        finally
+        {
+            _restartPending = false;
         }
     }
 
@@ -530,7 +592,7 @@ internal sealed class RecordingController : IDisposable
         }
 
         _indicator?.KeepOnTop();
-        int hours = _settings().MaxRecordingHours;
+        int hours = _maxHours;
         if (hours > 0 && session.Elapsed >= TimeSpan.FromHours(hours))
         {
             _ = StopAsync($"the maximum recording time ({hours} h) was reached", StopKind.MaxTime);

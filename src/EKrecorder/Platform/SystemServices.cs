@@ -276,6 +276,10 @@ internal sealed class SingleInstance : IDisposable
         try
         {
             using EventWaitHandle handle = EventWaitHandle.OpenExisting(exit ? ExitName(name) : ShowName(name));
+
+            // This process was started by the user and may bring a window to the front; the running copy, which
+            // opens Settings, may not unless it is given that right.
+            AppNative.AllowSetForegroundWindow(AppNative.ASFW_ANY);
             return handle.Set();
         }
         catch (Exception ex) when (ex is WaitHandleCannotBeOpenedException or UnauthorizedAccessException or IOException)
@@ -391,6 +395,9 @@ internal sealed class MessageWindow : NativeWindow, IDisposable
 
     public event Action? DisplayChanged;
 
+    /// <summary>Another program asked EKrecorder to close (for example taskkill without /F).</summary>
+    public event Action? CloseRequested;
+
     public void Dispose() => DestroyHandle();
 
     protected override void WndProc(ref Message m)
@@ -438,6 +445,13 @@ internal sealed class MessageWindow : NativeWindow, IDisposable
             case AppNative.WM_DISPLAYCHANGE:
                 DisplayChanged?.Invoke();
                 break;
+
+            case AppNative.WM_CLOSE:
+                // Not destroyed here: the shortcut, shutdown and sleep handling live in this window. EKrecorder
+                // saves any recording and exits instead.
+                CloseRequested?.Invoke();
+                m.Result = IntPtr.Zero;
+                return;
         }
 
         base.WndProc(ref m);

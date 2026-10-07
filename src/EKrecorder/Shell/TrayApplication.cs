@@ -59,7 +59,7 @@ internal sealed class TrayApplication : ApplicationContext
         var exit = new ToolStripMenuItem("Exit", null, (_, _) => _ = ExitAsync());
         _menu = new ContextMenuStrip();
         _menu.Items.AddRange([_startStop, new ToolStripSeparator(), settingsItem, openFolder, _openLast, new ToolStripSeparator(), exit]);
-        _menu.Opening += (_, _) => UpdateMenu();
+        _menu.Opening += (_, _) => UpdateMenu(checkLastRecording: true);
         _tray = new NotifyIcon { Icon = AppIcons.Idle, ContextMenuStrip = _menu, Visible = true };
         _tray.DoubleClick += (_, _) => ShowSettings();
         _tray.BalloonTipClicked += (_, _) => _balloonClick?.Invoke();
@@ -67,8 +67,15 @@ internal sealed class TrayApplication : ApplicationContext
         _controller.StateChanged += UpdateTray;
         _controller.Noticed += ShowNotice;
         _controller.Saved += RememberLastRecording;
-        _window.HotkeyPressed += () => _ = _controller.ToggleAsync("shortcut");
-        _window.QueryEndSession = () => _controller.IsRecording;
+        _window.HotkeyPressed += () =>
+        {
+            if (!_exiting)
+            {
+                _ = _controller.ToggleAsync("shortcut");
+            }
+        };
+        _window.QueryEndSession = () => _controller.Busy;
+        _window.CloseRequested += () => _ = ExitAsync();
         _window.EndingSession += OnEndingSession;
         _window.Suspending += OnSuspending;
         _window.Resumed += () => Log.Info("Windows woke up.");
@@ -163,13 +170,17 @@ internal sealed class TrayApplication : ApplicationContext
         UpdateMenu();
     }
 
-    private void UpdateMenu()
+    /// <param name="checkLastRecording">
+    /// Only when the menu opens: whether the last recording still exists (a folder on an unreachable network drive
+    /// can take long to answer, and this runs on the window thread).
+    /// </param>
+    private void UpdateMenu(bool checkLastRecording = false)
     {
         bool recording = _controller.IsRecording;
         _startStop.Text = recording ? "Stop recording" : "Start recording";
         _startStop.ShortcutKeyDisplayString = _hotkeys.Current.IsEmpty ? null : _hotkeys.Current.ToDisplay();
         _startStop.Enabled = _controller.State is RecorderState.Idle or RecorderState.Recording && !_exiting;
-        _openLast.Enabled = _settings.LastRecording is { } last && File.Exists(last);
+        _openLast.Enabled = _settings.LastRecording is { } last && (!checkLastRecording || File.Exists(last));
     }
 
     private void ShowSettings()
@@ -204,35 +215,44 @@ internal sealed class TrayApplication : ApplicationContext
         _ = form.LoadDevicesAsync();
     }
 
-    /// <summary>Saves and applies the Settings window's choices. Returns what went wrong, or null.</summary>
+    /// <summary>
+    /// Checks, saves and applies the Settings window's choices. Returns what went wrong, or null; when something
+    /// goes wrong nothing is changed (what was already applied is undone).
+    /// </summary>
     private string? ApplySettings(AppSettings updated)
     {
         // The window started from the settings of when it opened; what changed since without it (the last
         // recording) is kept.
         updated = updated with { LastRecording = _settings.LastRecording };
-        if (updated.Hotkey != _hotkeys.Current)
-        {
-            Hotkey previous = _hotkeys.Current;
-            if (_hotkeys.Register(updated.Hotkey) is { } problem)
-            {
-                _hotkeys.Register(previous);
-                return problem;
-            }
-        }
-
         string folder = _paths.RecordingsFolder(updated);
         if (!CanWriteTo(folder))
         {
             return "EKrecorder can't save recordings in that folder. Please choose another one.";
         }
 
-        if (updated.StartWithWindows != _settings.StartWithWindows && StartupRegistration.Apply(updated.StartWithWindows) is not null)
+        Hotkey previousHotkey = _hotkeys.Current;
+        bool hotkeyChanged = updated.Hotkey != previousHotkey;
+        if (hotkeyChanged && _hotkeys.Register(updated.Hotkey) is { } problem)
         {
+            _hotkeys.Register(previousHotkey);
+            return problem;
+        }
+
+        bool startupChanged = updated.StartWithWindows != _settings.StartWithWindows;
+        if (startupChanged && StartupRegistration.Apply(updated.StartWithWindows) is not null)
+        {
+            UndoHotkey();
             return "Windows didn't let EKrecorder change the Start with Windows setting. The log has more information.";
         }
 
         if (!SaveSettings(updated))
         {
+            UndoHotkey();
+            if (startupChanged)
+            {
+                StartupRegistration.Apply(_settings.StartWithWindows);
+            }
+
             return "EKrecorder couldn't save its settings. The log has more information.";
         }
 
@@ -241,6 +261,14 @@ internal sealed class TrayApplication : ApplicationContext
             + $"start with Windows {updated.StartWithWindows}, stop after {(updated.MaxRecordingHours == 0 ? "no limit" : $"{updated.MaxRecordingHours} h")}.");
         UpdateTray();
         return null;
+
+        void UndoHotkey()
+        {
+            if (hotkeyChanged)
+            {
+                _hotkeys.Register(previousHotkey);
+            }
+        }
     }
 
     private bool SaveSettings(AppSettings settings)
@@ -358,21 +386,15 @@ internal sealed class TrayApplication : ApplicationContext
     private void OnEndingSession()
     {
         Log.Info("Windows is ending the session (shutdown, restart or log off).");
-        if (_controller.IsRecording)
-        {
-            _controller.StopNow("Windows is shutting down", TimeSpan.FromSeconds(4), StopKind.Shutdown);
-        }
-
+        _controller.StopNow("Windows is shutting down", TimeSpan.FromSeconds(4), StopKind.Shutdown);
         Log.Info("Ready for Windows to end the session.");
     }
 
     private void OnSuspending()
     {
+        // Windows gives about two seconds here; a file not finished by then is finished after waking up.
         Log.Info("Windows is going to sleep.");
-        if (_controller.IsRecording)
-        {
-            _controller.StopNow("the PC is going to sleep", TimeSpan.FromSeconds(3), StopKind.Sleep);
-        }
+        _controller.StopNow("the PC is going to sleep", TimeSpan.FromSeconds(2), StopKind.Sleep);
     }
 
     private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e) =>
@@ -419,6 +441,9 @@ internal sealed class TrayApplication : ApplicationContext
             Log.Error($"Could not open {path}", ex);
         }
     }
+
+    /// <summary>True when nothing is being recorded or saved (Media Foundation can then be shut down).</summary>
+    public bool Idle => !_controller.Busy;
 
     private async Task ExitAsync()
     {

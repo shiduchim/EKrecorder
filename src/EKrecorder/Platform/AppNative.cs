@@ -5,6 +5,7 @@ namespace EKrecorder.Platform;
 /// <summary>The Windows functions the app shell uses (shortcut, shutdown, sleep, title bar).</summary>
 internal static class AppNative
 {
+    public const int WM_CLOSE = 0x0010;
     public const int WM_QUERYENDSESSION = 0x0011;
     public const int WM_ENDSESSION = 0x0016;
     public const int WM_DISPLAYCHANGE = 0x007E;
@@ -26,6 +27,12 @@ internal static class AppNative
     public const uint ES_SYSTEM_REQUIRED = 0x00000001;
 
     public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+    public const int ASFW_ANY = -1;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool AllowSetForegroundWindow(int processId);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

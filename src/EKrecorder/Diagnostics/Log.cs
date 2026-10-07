@@ -19,6 +19,7 @@ internal static class Log
     private static readonly Queue<string> Recent = new();
     private static StreamWriter? _writer;
     private static string? _folder;
+    private static DateTime _rollRetryAfter;
 
     public static string? FilePath { get; private set; }
 
@@ -121,12 +122,38 @@ internal static class Log
         _writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
     }
 
-    /// <summary>EKrecorder.log becomes EKrecorder.1.log, and so on; the oldest goes. Called with the lock held.</summary>
+    /// <summary>
+    /// EKrecorder.log becomes EKrecorder.1.log, and so on; the oldest goes. Called with the lock held. If another
+    /// program holds the log open so that it cannot be renamed, nothing is shifted (older logs are kept), it is tried
+    /// again a minute later, and a log that grows on is continued in a new file.
+    /// </summary>
     private static void Roll()
     {
+        if (DateTime.UtcNow < _rollRetryAfter)
+        {
+            return;
+        }
+
         _writer?.Dispose();
         _writer = null;
         string folder = _folder!;
+        string rolling = Path.Combine(folder, "EKrecorder.rolling.log");
+        try
+        {
+            File.Move(FilePath!, rolling, overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _rollRetryAfter = DateTime.UtcNow.AddMinutes(1);
+            if (new FileInfo(FilePath!).Length > 2 * MaxFileBytes)
+            {
+                FilePath = Path.Combine(folder, $"EKrecorder-overflow-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            }
+
+            OpenWriter();
+            return;
+        }
+
         try
         {
             File.Delete(Path.Combine(folder, $"EKrecorder.{KeptFiles - 1}.log"));
@@ -139,22 +166,25 @@ internal static class Log
                 }
             }
 
-            File.Move(FilePath!, Path.Combine(folder, "EKrecorder.1.log"), overwrite: true);
+            File.Move(rolling, Path.Combine(folder, "EKrecorder.1.log"), overwrite: true);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Another program has a log file open: keep writing to the current file and try again later.
+            // An older log is held open by another program: the newest stays as EKrecorder.rolling.log for now.
         }
 
+        // After an overflow file, back to the usual name.
+        FilePath = Path.Combine(folder, "EKrecorder.log");
         OpenWriter();
     }
 
-    /// <summary>The test builds wrote one log per start; those older than a month go.</summary>
+    /// <summary>The test builds wrote one log per start, and overflow logs are rare; those older than a month go.</summary>
     private static void PruneOldLogs(string folder)
     {
         try
         {
-            foreach (FileInfo file in new DirectoryInfo(folder).EnumerateFiles("EKrecorder-spike-*.log"))
+            var directory = new DirectoryInfo(folder);
+            foreach (FileInfo file in directory.EnumerateFiles("EKrecorder-spike-*.log").Concat(directory.EnumerateFiles("EKrecorder-overflow-*.log")))
             {
                 if (file.LastWriteTimeUtc < DateTime.UtcNow.AddDays(-30))
                 {

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using EKrecorder.App;
 using EKrecorder.Diagnostics;
 using EKrecorder.Platform;
@@ -70,13 +71,25 @@ internal static class Program
 
         Log.Info($"Data in {paths.Root}; recordings go to {paths.RecordingsFolder(settings)}.");
         List<Leftover> leftovers = RecoveryService.FindLeftovers(paths);
-        using (var app = new TrayApplication(paths, store, settings, firstRun: !existed, leftovers, instance, showSettings: !background))
+        // A damaged settings file was kept aside; the defaults are saved in its place.
+        bool idle;
+        using (var app = new TrayApplication(paths, store, settings, firstRun: !existed || problem is not null, leftovers, instance, showSettings: !background))
         {
             instance.StartListening();
             Application.Run(app);
+            idle = app.Idle;
         }
 
-        MediaFoundation.Shutdown();
+        if (idle)
+        {
+            MediaFoundation.Shutdown();
+        }
+        else
+        {
+            // A recording thread that did not finish in time may still use it; the file is recovered at the next start.
+            Log.Warn("A recording was still being written at exit; Media Foundation is left to Windows.");
+        }
+
         Log.Info("EKrecorder exited.");
         Log.Stop();
         return 0;
@@ -85,12 +98,45 @@ internal static class Program
     /// <summary>Asks the running EKrecorder to save any recording and exit, and waits for it (at most 3 minutes).</summary>
     private static int ExitRunningCopy()
     {
-        if (!SingleInstance.Signal(InstanceName, exit: true))
+        // The running copies, taken before they are asked to exit: the wait ends when the processes are gone (and
+        // their exe is free for an update), not merely when they let go of the single-instance lock.
+        // (The installer runs this from a copy with another name; the running copy is always EKrecorder.exe, in this
+        // Windows session.)
+        int session = Process.GetCurrentProcess().SessionId;
+        Process[] running = Process.GetProcessesByName("EKrecorder")
+            .Where(p => p.Id != Environment.ProcessId && p.SessionId == session)
+            .ToArray();
+        try
         {
+            if (!SingleInstance.Signal(InstanceName, exit: true))
+            {
+                return 0;
+            }
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(3);
+            if (!SingleInstance.WaitUntilGone(InstanceName, deadline - DateTime.UtcNow))
+            {
+                return 1;
+            }
+
+            foreach (Process process in running)
+            {
+                TimeSpan left = deadline - DateTime.UtcNow;
+                if (left <= TimeSpan.Zero || !process.WaitForExit(left))
+                {
+                    return 1;
+                }
+            }
+
             return 0;
         }
-
-        return SingleInstance.WaitUntilGone(InstanceName, TimeSpan.FromMinutes(3)) ? 0 : 1;
+        finally
+        {
+            foreach (Process process in running)
+            {
+                process.Dispose();
+            }
+        }
     }
 
     private static int RunSelfTest(string mode, string[] args)

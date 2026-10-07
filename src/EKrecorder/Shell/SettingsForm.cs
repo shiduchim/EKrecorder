@@ -180,6 +180,9 @@ internal sealed class SettingsForm : Form
         AcceptButton = _save;
         CancelButton = cancel;
 
+        // The window is not modal, so DialogResult alone would not close it (Esc also comes here).
+        cancel.Click += (_, _) => Close();
+
         // Values
         FillMonitors();
         _videoQuality.Value = settings.VideoQuality;
