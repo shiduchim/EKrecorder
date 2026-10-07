@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 
 namespace EKrecorder.Shell;
 
@@ -712,6 +713,7 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
     private UiTheme? _theme;
     private UiFonts? _fonts;
     private float _scale = 1;
+    private bool _hover;
 
     public ThemedComboBox()
     {
@@ -749,22 +751,77 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
 
     protected override void WndProc(ref Message m)
     {
-        base.WndProc(ref m);
-        if (_theme is null || !IsHandleCreated)
+        if (_theme is not null && IsHandleCreated)
         {
-            return;
+            // The closed list is drawn entirely here (the native one would add its own frame and arrow).
+            if (m.Msg == WmPaint && m.WParam != IntPtr.Zero)
+            {
+                // Painting into a DC the caller supplied.
+                using Graphics g = Graphics.FromHdc(m.WParam);
+                PaintClosed(g);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+
+            if (m.Msg == WmPaint)
+            {
+                IntPtr dc = BeginPaint(Handle, out PaintStruct paint);
+                try
+                {
+                    using Graphics g = Graphics.FromHdc(dc);
+                    PaintClosed(g);
+                }
+                finally
+                {
+                    EndPaint(Handle, ref paint);
+                }
+
+                m.Result = IntPtr.Zero;
+                return;
+            }
+
+            if (m.Msg == WmPrintClient && m.WParam != IntPtr.Zero)
+            {
+                using Graphics g = Graphics.FromHdc(m.WParam);
+                PaintClosed(g);
+                m.Result = IntPtr.Zero;
+                return;
+            }
         }
 
-        if (m.Msg == WmPaint)
-        {
-            using Graphics g = Graphics.FromHwnd(Handle);
-            PaintFrame(g);
-        }
-        else if (m.Msg == WmPrintClient && m.WParam != IntPtr.Zero)
-        {
-            using Graphics g = Graphics.FromHdc(m.WParam);
-            PaintFrame(g);
-        }
+        base.WndProc(ref m);
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        base.OnMouseEnter(e);
+        _hover = true;
+        Invalidate();
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        _hover = false;
+        Invalidate();
+    }
+
+    protected override void OnDropDownClosed(EventArgs e)
+    {
+        base.OnDropDownClosed(e);
+        Invalidate();
+    }
+
+    protected override void OnSelectedIndexChanged(EventArgs e)
+    {
+        base.OnSelectedIndexChanged(e);
+        Invalidate();
+    }
+
+    protected override void OnEnabledChanged(EventArgs e)
+    {
+        base.OnEnabledChanged(e);
+        Invalidate();
     }
 
     protected override void OnGotFocus(EventArgs e)
@@ -820,41 +877,68 @@ internal sealed class ThemedComboBox : ComboBox, IThemed
 
     private int ButtonWidth() => D(32);
 
-    /// <summary>Over the native frame and button: a rounded frame, the chevron, and the focus line.</summary>
-    private void PaintFrame(Graphics g)
+    /// <summary>The closed list: a rounded field with the chosen name and a chevron, and an accent line while it has the focus.</summary>
+    private void PaintClosed(Graphics g)
     {
         UiTheme theme = _theme!;
         Rectangle r = ClientRectangle;
         int border = Math.Max(1, (int)Math.Round(_scale));
-        int button = ButtonWidth();
-        using (var fill = new SolidBrush(theme.Control))
+        Color fill = !Enabled ? theme.Control : DroppedDown ? theme.ControlPressed : _hover ? theme.ControlHover : theme.Control;
+        using (var corners = new SolidBrush(Parent?.BackColor ?? theme.Card))
         {
-            g.FillRectangle(fill, r.Right - button - border, border, button, r.Height - (2 * border));
+            g.FillRectangle(corners, r);
         }
 
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new RectangleF(border / 2f, border / 2f, r.Width - border - 0.5f, r.Height - border - 0.5f);
         using (GraphicsPath shape = Glyphs.Rounded(bounds, D(4)))
-        using (var outside = new Region(new Rectangle(Point.Empty, r.Size)))
+        using (var brush = new SolidBrush(fill))
+        using (var pen = new Pen(theme.ControlBorder, border))
         {
-            outside.Exclude(shape);
-            using (var corners = new SolidBrush(Parent?.BackColor ?? theme.Card))
-            {
-                g.FillRegion(corners, outside);
-            }
-
-            using var pen = new Pen(Enabled ? theme.ControlBorder : theme.DisabledText, border);
+            g.FillPath(brush, shape);
             g.DrawPath(pen, shape);
         }
 
         g.SmoothingMode = SmoothingMode.None;
-        Glyphs.Draw(g, Glyphs.ChevronDown, new Rectangle(r.Right - button, 0, button, r.Height), Enabled ? theme.SecondaryText : theme.DisabledText, 12 * _scale);
+        int button = ButtonWidth();
+        if (_fonts is not null && SelectedIndex >= 0)
+        {
+            var text = new Rectangle(D(11), 0, Math.Max(0, r.Width - D(11) - button), r.Height);
+            TextRenderer.DrawText(g, GetItemText(SelectedItem), _fonts.Body, text, Enabled ? theme.Text : theme.DisabledText, fill,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        }
+
+        Glyphs.Draw(g, Glyphs.ChevronDown, new Rectangle(r.Right - button, 0, button - D(4), r.Height), Enabled ? theme.SecondaryText : theme.DisabledText, 12 * _scale);
         if (Focused || DroppedDown)
         {
             int line = Math.Max(2, (int)Math.Round(2 * _scale));
             using var accent = new SolidBrush(theme.Accent);
             g.FillRectangle(accent, D(3), r.Height - line - border, r.Width - D(6), line);
         }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr BeginPaint(IntPtr window, out PaintStruct paint);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EndPaint(IntPtr window, ref PaintStruct paint);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PaintStruct
+    {
+        public IntPtr Dc;
+        public int Erase;
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+        public int Restore;
+        public int IncUpdate;
+        public long Reserved1;
+        public long Reserved2;
+        public long Reserved3;
+        public long Reserved4;
     }
 
     private int D(float dip) => (int)Math.Round(dip * _scale);
