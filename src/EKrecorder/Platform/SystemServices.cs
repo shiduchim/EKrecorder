@@ -134,6 +134,12 @@ internal sealed class HotkeyManager : IDisposable
 
     public bool Suspended { get; private set; }
 
+    /// <summary>
+    /// Whether <paramref name="hotkey"/> is EKrecorder's working shortcut: registered, or only set aside while Settings
+    /// records a new one. False when Windows refused it (at start, or when it was taken back after Settings).
+    /// </summary>
+    public bool Holds(Hotkey hotkey) => !hotkey.IsEmpty && hotkey == Current && (_registered || Suspended);
+
     public static string Taken => "EKrecorder couldn't use that shortcut because another program is already using it.";
 
     /// <summary>Registers <paramref name="hotkey"/> instead of the current one. On failure nothing is registered and the reason is returned.</summary>

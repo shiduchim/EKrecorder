@@ -32,7 +32,7 @@ internal enum InputState
 }
 
 /// <summary>A snapshot of one input for the window.</summary>
-internal sealed record AudioInputStatus(string Input, InputState State, string Devices, string Mode, float Level, string? Warning);
+internal sealed record AudioInputStatus(string Input, InputState State, string Devices, string Mode, float Level, string? Warning, string? DeviceId = null);
 
 /// <summary>
 /// Captures the microphone and the computer audio for one recording (or for the window's meters), and keeps both
@@ -919,7 +919,8 @@ internal sealed unsafe class AudioCapture : IDisposable
             float level = _level;
             _level = 0;
             string? warning = DigitalSilence ? "only exact digital silence: muted, or blocked by Windows privacy settings?" : null;
-            return new AudioInputStatus(Name, State, Devices, Mode, level, warning);
+            string? running = Endpoints.FirstOrDefault(e => e.Worker?.State == WorkerState.Running)?.Id;
+            return new AudioInputStatus(Name, State, Devices, Mode, level, warning, running);
         }
 
         /// <summary>For the report (lock held).</summary>

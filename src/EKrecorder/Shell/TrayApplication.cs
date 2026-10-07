@@ -231,7 +231,7 @@ internal sealed class TrayApplication : ApplicationContext
         }
 
         Hotkey previousHotkey = _hotkeys.Current;
-        bool hotkeyChanged = updated.Hotkey != previousHotkey;
+        bool hotkeyChanged = updated.Hotkey != previousHotkey || (!updated.Hotkey.IsEmpty && !_hotkeys.Holds(updated.Hotkey)); // a refused one is tried again
         if (hotkeyChanged && _hotkeys.Register(updated.Hotkey) is { } problem)
         {
             _hotkeys.Register(previousHotkey);

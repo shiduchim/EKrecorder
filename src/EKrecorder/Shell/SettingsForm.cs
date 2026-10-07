@@ -87,6 +87,8 @@ internal sealed class SettingsForm : Form
     private long _nextMuteCheck;
     private long _outputHeardAt;
     private string _micDefaultName = "";
+    private string? _micCapturedId;
+    private readonly bool _showPicker;
     private string _outputDefaultName = "";
 
     /// <summary>The test chime, in memory that never moves (Windows reads it while it plays, after PlaySound returns).</summary>
@@ -105,6 +107,9 @@ internal sealed class SettingsForm : Form
         _monitorId = settings.MonitorId;
         _monitorName = settings.MonitorName;
         _folder = settings.RecordingFolder ?? AppPaths.DesktopRecordings;
+
+        // The monitor picture: with several monitors, or when the saved one is gone (to choose the one that is here).
+        _showPicker = monitors.Count > 1 || (monitors.Count > 0 && settings.MonitorId is { } saved && monitors.All(m => m.StableId != saved));
 
         Text = "EKrecorder settings";
         Icon = AppIcons.App;
@@ -418,6 +423,10 @@ internal sealed class SettingsForm : Form
         base.OnShown(e);
         BeginInvoke(StartPreview);
         CheckFolder();
+        if (ShortcutNotWorking())
+        {
+            CheckShortcut(); // says whether another program still holds it
+        }
     }
 
     protected override void OnActivated(EventArgs e)
@@ -665,7 +674,7 @@ internal sealed class SettingsForm : Form
 
         // Recording
         y = PlaceHeading(_recordingHeading, pad, y, first: true);
-        bool severalMonitors = _monitors.Count > 1;
+        bool severalMonitors = _showPicker;
         _monitorPicker.Visible = severalMonitors;
         _identifyButton.Visible = severalMonitors;
         _identifyButton.Size = _identifyButton.PreferredSize;
@@ -864,6 +873,11 @@ internal sealed class SettingsForm : Form
             _shortcutCard.Subtitle = problem;
             _shortcutCard.SubtitleColor = _theme.Error;
         }
+        else if (ShortcutNotWorking())
+        {
+            _shortcutCard.Subtitle = "Not working now · Save to try again";
+            _shortcutCard.SubtitleColor = _theme.Warning;
+        }
         else
         {
             _shortcutCard.Subtitle = _shortcut.Value.IsEmpty ? "None · use the tray icon to start and stop" : "Start or stop from any app";
@@ -875,8 +889,13 @@ internal sealed class SettingsForm : Form
             ShowDevicesIdle();
         }
 
-        _save.Enabled = BuildSettings() != _original;
+        // Device and monitor names only go with their ids (Windows may rename a device): they are not a change.
+        static AppSettings Comparable(AppSettings s) => s with { MonitorName = null, MicrophoneName = null, OutputName = null };
+        _save.Enabled = Comparable(BuildSettings()) != Comparable(_original) || ShortcutNotWorking();
     }
+
+    /// <summary>The saved shortcut is shown but does not work (Windows refused it): Save tries it again.</summary>
+    private bool ShortcutNotWorking() => _shortcut.Value == _original.Hotkey && !_shortcut.Value.IsEmpty && !_hotkeys.Holds(_shortcut.Value);
 
     /// <summary>
     /// The folder (as "Desktop › EKrecordings"), or why it would not do: missing, or nearly full. Uses the last
@@ -1019,12 +1038,20 @@ internal sealed class SettingsForm : Form
     private void ShowMicrophone(AudioInputStatus status)
     {
         bool capturing = status.State is InputState.Running or InputState.Fallback;
+        _micCapturedId = capturing ? status.DeviceId : null;
+        if (status.Warning is not null)
+        {
+            // Only exact zeros for a while (a hardware mute switch): what was heard before no longer counts.
+            _micHeard = false;
+        }
+
         _micHeard |= capturing && status.Level >= HeardLevel;
         (string text, Color? color, string glyph, string link) = status.State switch
         {
             InputState.Running or InputState.Fallback when _micMuted == true => ("Muted in Windows", _theme.Error, "", "Unmute"),
             InputState.Running or InputState.Fallback when status.Warning is not null && !_micHeard => ("No sound · check the mic's mute switch", _theme.Warning, "", ""),
-            InputState.Fallback => ("Not connected · Windows default is used", _theme.Warning, "", ""),
+            InputState.Fallback when Choice().MicrophoneId is null => ("Default mic not responding · using another one", _theme.Warning, "", ""),
+            InputState.Fallback => ("Not available · Windows default is used", _theme.Warning, "", ""),
             InputState.Running when _micHeard => ("Working", _theme.Success, Glyphs.CheckMark, ""),
             InputState.Running => ("Speak to test", (Color?)null, "", ""),
             InputState.NoDevice => ("No microphone found", _theme.Warning, "", ""),
@@ -1048,7 +1075,7 @@ internal sealed class SettingsForm : Form
         bool playing = _outputHeardAt > 0 && now - _outputHeardAt < 1500;
         (string text, Color? color, string glyph) = status.State switch
         {
-            InputState.Fallback => ("Not connected · Windows default is used", _theme.Warning, ""),
+            InputState.Fallback => ("Not available · Windows default is used", _theme.Warning, ""),
             InputState.Running when playing => ("Working", _theme.Success, Glyphs.CheckMark),
             InputState.Running => ("Nothing playing", (Color?)null, ""),
             InputState.NoDevice => ("No speakers or headset found", _theme.Warning, ""),
@@ -1084,12 +1111,12 @@ internal sealed class SettingsForm : Form
 
         _muteCheckRunning = true;
         _nextMuteCheck = now + 1000;
-        string? id = Choice().MicrophoneId;
+        string? id = MicrophoneInUse();
         _ = Task.Run(() => CoreAudio.IsMicrophoneMuted(id)).ContinueWith(
             t =>
             {
                 _muteCheckRunning = false;
-                if (!IsDisposed && Choice().MicrophoneId == id)
+                if (!IsDisposed && MicrophoneInUse() == id)
                 {
                     _micMuted = t.IsCompletedSuccessfully ? t.Result : null;
                 }
@@ -1097,9 +1124,12 @@ internal sealed class SettingsForm : Form
             TaskScheduler.FromCurrentSynchronizationContext());
     }
 
+    /// <summary>The microphone the meter listens to (Windows' default when a chosen one is not available), else the chosen one.</summary>
+    private string? MicrophoneInUse() => _micCapturedId ?? Choice().MicrophoneId;
+
     private void Unmute()
     {
-        string? id = Choice().MicrophoneId;
+        string? id = MicrophoneInUse();
         _ = Task.Run(() => CoreAudio.UnmuteMicrophone(id)).ContinueWith(
             t =>
             {
