@@ -32,9 +32,14 @@ If the PC crashes or the power goes
     %LocalAppData%\EKrecorder\InProgress\Unrecoverable.
 
 Settings (double-click the EKrecorder icon)
-  - Monitor, video quality (480p to 4K, 30 fps), recordings folder
-  - Microphone, computer audio, audio quality
+  - Monitor, video quality (480p to 4K, 30 fps; 4K is the default), recordings
+    folder
+  - Microphone, computer audio, audio quality. While Settings is open, each
+    one shows a live level bar and a word of status: "Working" means sound
+    gets through. "Muted in Windows" has an Unmute link. The play button
+    plays a short test sound. Nothing is recorded while you test.
   - Start/stop shortcut, maximum recording time, Start EKrecorder with Windows
+  - Changes apply to the next recording.
 
 Problems
   - Logs: %LocalAppData%\EKrecorder\Logs

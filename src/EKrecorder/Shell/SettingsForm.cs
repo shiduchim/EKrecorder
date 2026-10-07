@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using EKrecorder.App;
 using EKrecorder.Audio;
 using EKrecorder.Diagnostics;
@@ -67,6 +68,7 @@ internal sealed class SettingsForm : Form
     private readonly PillButton _cancel = new() { Text = "Cancel", DialogResult = DialogResult.Cancel };
     private readonly AudioPreview _preview = new();
     private readonly System.Windows.Forms.Timer _meterTimer = new() { Interval = 33 };
+    private readonly System.Windows.Forms.Timer _restartTimer = new() { Interval = 300 };
     private readonly ToolTip _tips = new();
     private readonly UiTheme _theme;
     private UiFonts _fonts;
@@ -77,8 +79,8 @@ internal sealed class SettingsForm : Form
     private string? _monitorName;
     private string _folder;
     private string? _shortcutProblem;
-    private System.Media.SoundPlayer? _testPlayer;
-    private MemoryStream? _testWave;
+    private FolderCheck? _folderCheck;
+    private bool _closed;
     private bool _micHeard;
     private bool? _micMuted;
     private bool _muteCheckRunning;
@@ -86,6 +88,9 @@ internal sealed class SettingsForm : Form
     private long _outputHeardAt;
     private string _micDefaultName = "";
     private string _outputDefaultName = "";
+
+    /// <summary>The test chime, in memory that never moves (Windows reads it while it plays, after PlaySound returns).</summary>
+    private static byte[]? _chime;
 
     /// <summary>Marks the controls on a device card's second line (they sit under the title, by design).</summary>
     private const string Line2 = "line 2";
@@ -186,6 +191,7 @@ internal sealed class SettingsForm : Form
         _save.Click += (_, _) => Save();
         _cancel.Click += (_, _) => Close(); // not modal: DialogResult alone would not close it (Esc comes here too)
         _meterTimer.Tick += (_, _) => ShowLevels();
+        _restartTimer.Tick += (_, _) => RestartPreview();
 
         ApplyTheme();
     }
@@ -343,6 +349,15 @@ internal sealed class SettingsForm : Form
     {
         base.OnShown(e);
         BeginInvoke(StartPreview);
+        CheckFolder();
+    }
+
+    protected override void OnActivated(EventArgs e)
+    {
+        base.OnActivated(e);
+
+        // Whatever stopped the meters while the window stayed open (a cancelled shutdown), they come back.
+        StartPreview();
     }
 
     protected override void OnResize(EventArgs e)
@@ -368,21 +383,17 @@ internal sealed class SettingsForm : Form
         }
     }
 
-    protected override void OnFormClosing(FormClosingEventArgs e)
-    {
-        StopPreview();
-        base.OnFormClosing(e);
-    }
-
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        // Not in FormClosing: Windows asks that at a shutdown that can still be cancelled, and the window stays.
+        _closed = true;
         StopPreview();
         _preview.Dispose();
         _meterTimer.Dispose();
+        _restartTimer.Dispose();
         _hotkeys.Resume();
         _tips.Dispose();
-        _testPlayer?.Dispose();
-        _testWave?.Dispose();
+        AppNative.PlaySound(IntPtr.Zero, IntPtr.Zero, 0); // stops the test chime
         base.OnFormClosed(e);
     }
 
@@ -474,6 +485,7 @@ internal sealed class SettingsForm : Form
         return folder;
     }
 
+    /// <summary>A WAV file: two soft notes, 0.7 s.</summary>
     private static MemoryStream TestChime()
     {
         const int rate = 48000;
@@ -786,38 +798,54 @@ internal sealed class SettingsForm : Form
         _save.Enabled = BuildSettings() != _original;
     }
 
-    /// <summary>The folder (as "Desktop › EKrecordings"), or why it would not do: missing, or nearly full.</summary>
+    /// <summary>
+    /// The folder (as "Desktop › EKrecordings"), or why it would not do: missing, or nearly full. Uses the last
+    /// <see cref="CheckFolder"/>: a folder on an unreachable network drive must not freeze the window (and the tray).
+    /// </summary>
     private void ShowFolder(double gigabytesPerHour)
     {
         _folderCard.Subtitle = FriendlyPath(_folder);
         _folderCard.SubtitleColor = null;
         _tips.SetToolTip(_folderCard, _folder);
-        bool isDefault = string.Equals(_folder, AppPaths.DesktopRecordings, StringComparison.OrdinalIgnoreCase);
-        try
+        if (_folderCheck is not { } check || !string.Equals(check.Folder, _folder, StringComparison.OrdinalIgnoreCase))
         {
-            if (!isDefault && !Directory.Exists(_folder))
-            {
-                _folderCard.Subtitle = "Folder not found · choose another one";
-                _folderCard.SubtitleColor = _theme.Error;
-                return;
-            }
+            return;
+        }
 
-            string? root = Path.GetPathRoot(Path.GetFullPath(_folder));
-            if (root is not null && new DriveInfo(root) is { IsReady: true } drive && gigabytesPerHour > 0)
+        bool isDefault = string.Equals(_folder, AppPaths.DesktopRecordings, StringComparison.OrdinalIgnoreCase);
+        if (!isDefault && !check.Exists)
+        {
+            _folderCard.Subtitle = "Folder not found · choose another one";
+            _folderCard.SubtitleColor = _theme.Error;
+            return;
+        }
+
+        if (check.FreeBytes is { } bytes && gigabytesPerHour > 0)
+        {
+            double free = bytes / 1e9;
+            double hours = free / gigabytesPerHour;
+            if (hours < 3)
             {
-                double free = drive.AvailableFreeSpace / 1e9;
-                double hours = free / gigabytesPerHour;
-                if (hours < 3)
-                {
-                    _folderCard.Subtitle = string.Create(CultureInfo.InvariantCulture, $"Only {free:0} GB free · about {Math.Max(0, hours):0.#} hours at this quality");
-                    _folderCard.SubtitleColor = _theme.Warning;
-                }
+                _folderCard.Subtitle = string.Create(CultureInfo.InvariantCulture, $"Only {free:0} GB free · about {Math.Max(0, hours):0.#} hours at this quality");
+                _folderCard.SubtitleColor = _theme.Warning;
             }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        {
-            // The folder's drive cannot be read now; the folder is shown as it is.
-        }
+    }
+
+    /// <summary>Looks at the folder and its drive off the window thread, then shows what was found.</summary>
+    private void CheckFolder()
+    {
+        string folder = _folder;
+        _ = Task.Run(() => FolderCheck.Of(folder)).ContinueWith(
+            t =>
+            {
+                if (!IsDisposed && t.IsCompletedSuccessfully && string.Equals(folder, _folder, StringComparison.OrdinalIgnoreCase))
+                {
+                    _folderCheck = t.Result;
+                    ShowDetails();
+                }
+            },
+            TaskScheduler.FromCurrentSynchronizationContext());
     }
 
     /// <summary>Without the preview: the meters are empty and say nothing yet.</summary>
@@ -848,17 +876,31 @@ internal sealed class SettingsForm : Form
         _micHeard = false;
         _micMuted = null;
         _nextMuteCheck = 0;
-        if (_meterTimer.Enabled)
+        if (_meterTimer.Enabled && !_preview.IsShowing(Selection()))
         {
-            _preview.Show(Selection());
+            // Stepping through a list with the arrow keys picks every device on the way: only the one it stops on is
+            // opened.
+            _preview.Close();
+            ShowDevicesIdle();
+            _restartTimer.Stop();
+            _restartTimer.Start();
         }
 
         ShowDetails();
     }
 
+    private void RestartPreview()
+    {
+        _restartTimer.Stop();
+        if (_meterTimer.Enabled)
+        {
+            _preview.Show(Selection());
+        }
+    }
+
     private void StartPreview()
     {
-        if (IsDisposed || !Visible || WindowState == FormWindowState.Minimized || _meterTimer.Enabled)
+        if (_closed || IsDisposed || !Visible || WindowState == FormWindowState.Minimized || _meterTimer.Enabled)
         {
             return;
         }
@@ -876,6 +918,7 @@ internal sealed class SettingsForm : Form
         }
 
         _meterTimer.Stop();
+        _restartTimer.Stop();
         _preview.Close();
         ShowDevicesIdle();
     }
@@ -990,23 +1033,19 @@ internal sealed class SettingsForm : Form
     }
 
     /// <summary>A short two-note chime on Windows' default output, so the computer-audio meter can be seen moving.</summary>
-    private void PlayTestSound()
+    private static void PlayTestSound()
     {
-        try
+        if (_chime is null)
         {
-            if (_testPlayer is null)
-            {
-                _testWave = TestChime();
-                _testPlayer = new System.Media.SoundPlayer(_testWave);
-                _testPlayer.Load();
-            }
-
-            _testWave!.Position = 0;
-            _testPlayer.Play();
+            using MemoryStream wave = TestChime();
+            byte[] pinned = GC.AllocateUninitializedArray<byte>((int)wave.Length, pinned: true);
+            wave.ToArray().CopyTo(pinned, 0);
+            _chime = pinned;
         }
-        catch (Exception ex) when (ex is InvalidOperationException or TimeoutException or IOException)
+
+        if (!AppNative.PlaySound(Marshal.UnsafeAddrOfPinnedArrayElement(_chime, 0), IntPtr.Zero, AppNative.SND_MEMORY | AppNative.SND_ASYNC | AppNative.SND_NODEFAULT))
         {
-            Log.Warn($"Playing the test sound failed: {ex.Message}");
+            Log.Warn("Playing the test sound failed (no sound device?).");
         }
     }
 
@@ -1017,12 +1056,13 @@ internal sealed class SettingsForm : Form
             Description = "Choose where EKrecorder saves recordings",
             UseDescriptionForTitle = true,
             ShowNewFolderButton = true,
-            InitialDirectory = Directory.Exists(_folder) ? _folder : Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+            InitialDirectory = _folderCheck is { Exists: true } check && check.Folder == _folder ? _folder : Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
         };
         if (dialog.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dialog.SelectedPath))
         {
             _folder = dialog.SelectedPath;
             ShowDetails();
+            CheckFolder();
         }
     }
 
@@ -1084,6 +1124,30 @@ internal sealed class SettingsForm : Form
 
     /// <summary>The devices chosen in the window.</summary>
     private sealed record AudioSettingsChoice(string? MicrophoneId, string? MicrophoneName, string? OutputId, string? OutputName);
+
+    /// <summary>What was found about the recordings folder: whether it exists, and its drive's free space (if readable).</summary>
+    private sealed record FolderCheck(string Folder, bool Exists, long? FreeBytes)
+    {
+        public static FolderCheck Of(string folder)
+        {
+            bool exists = false;
+            long? free = null;
+            try
+            {
+                exists = Directory.Exists(folder);
+                if (Path.GetPathRoot(Path.GetFullPath(folder)) is { Length: > 0 } root && new DriveInfo(root) is { IsReady: true } drive)
+                {
+                    free = drive.AvailableFreeSpace;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or System.Security.SecurityException)
+            {
+                // The folder's drive cannot be read now; the folder is shown as it is.
+            }
+
+            return new FolderCheck(folder, exists, free);
+        }
+    }
 
     /// <summary>An entry in a device list: Windows' default (no id) or a specific device.</summary>
     private sealed record DeviceChoice(string? Id, string Name, bool? Connected = true)

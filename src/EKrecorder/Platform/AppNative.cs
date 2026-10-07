@@ -72,6 +72,15 @@ internal static class AppNative
     [DllImport("dwmapi.dll")]
     public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
 
+    public const uint SND_ASYNC = 0x0001;
+    public const uint SND_NODEFAULT = 0x0002;
+    public const uint SND_MEMORY = 0x0004;
+
+    /// <summary>Plays a WAV held in memory (with SND_ASYNC it is read after the call returns: the memory must not move).</summary>
+    [DllImport("winmm.dll", EntryPoint = "PlaySoundW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PlaySound(IntPtr sound, IntPtr module, uint flags);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct REASON_CONTEXT
     {

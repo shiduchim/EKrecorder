@@ -22,9 +22,20 @@ For testing without installing, **EKrecorder-win-x64** holds the same single `EK
 | Settings | double-click the tray icon |
 | Recordings | `Desktop\EKrecordings` by default; tray menu → Open recordings folder / Open last recording |
 
-Settings: monitor (with Identify), video quality (480p · 720p · 1080p · **1440p** · 4K, all 30 fps), recordings folder,
-microphone and computer audio (Windows defaults or a specific device), audio quality (96 · **128** · 160 · 192 ·
-256 kbps), start/stop shortcut, maximum recording time, start with Windows. Bold = default.
+Settings follows Windows' light or dark mode, accent colour and display scale (each monitor its own, 100 % to 225 %
+and beyond). Bold = default.
+
+- **Recording:** the monitor (a small picture of your monitors as Windows arranges them, plus Identify), video quality
+  (480p · 720p · 1080p · 1440p · **4K**, all 30 fps; 4K is about 5.5 GB per hour; a level larger than the monitor
+  records at the monitor's own size and bitrate), and the recordings folder.
+- **Audio:** microphone and computer audio, each the Windows default (its name is shown) or a specific device. While
+  Settings is open each has a live level meter and a one-line status: **Working**, **Speak to test** /
+  **Nothing playing**, **Muted in Windows** (with an Unmute link), **No sound · check the mic's mute switch**,
+  **Not connected**. The ▷ button plays a short test sound. Nothing is recorded while you test. Audio quality:
+  96 · **128** · 160 · 192 · 256 kbps.
+- **Start and stop:** the shortcut, a maximum recording time, and start with Windows.
+
+Changes apply to the next recording; Save is available only after something changes.
 
 ## How it keeps recordings safe
 

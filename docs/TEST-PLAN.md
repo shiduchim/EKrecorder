@@ -10,7 +10,8 @@ monitor). **On the PC** = needs the real machine. After each test, the recording
 |---|---|---|
 | Monitor 1 and Monitor 2 | records the build machine's monitor | Settings → pick each monitor, record 30 s each |
 | 1080p and 4K → 1080p scaling | output size rule (unit tests), 4K software encode | 1080p step on Monitor 2 (4K): file is 1920×1080 |
-| 1440p (default) and 4K | 4K encode, A/V timing at 4K | 1440p and 4K steps on Monitor 2 |
+| 4K (default) and 1440p | 4K encode, A/V timing at 4K, bitrate by output size (unit tests) | 4K and 1440p steps on Monitor 2; Settings shows "Up to 5.5 GB per hour" at 4K |
+| 4K step on the 1080p monitor | bitrate of the size actually recorded (unit tests) | Monitor 1 at 4K: file is 1920×1080, Settings says "Monitor 1 is 1080p" |
 | 30 fps | frame count / duration of every test recording | report: "Frame rate 30 fps", dropped frames 0 |
 | Scrolling, Revit text, menus, mouse | – | scroll a Revit sheet and a long PDF; text sharp when paused |
 | Hardware encoder (NVIDIA) | – (no GPU) | report: "NVIDIA hardware H.264 encoder", GPU path |
@@ -57,6 +58,13 @@ monitor). **On the PC** = needs the real machine. After each test, the recording
 | Tray menu | – | each item |
 | Settings remembered | save/load, damaged file (unit + self-test) | change everything, Exit, start again |
 | Settings Cancel / Esc | – | change something, press Esc: window closes, nothing changed |
-| No microphone held open while idle | devices open only in a recording | Windows privacy indicator (mic icon) off while idle |
+| No microphone held open while idle | devices open only in a recording or while Settings is on the screen | Windows privacy indicator (mic icon) off once Settings is closed or minimized |
 | No test/debug text | – | look at Settings and the tray menu |
+| Settings at 100 % and 200 % | laid out at 100–225 %, light and dark: nothing cut off or overlapping (self-test, screenshots) | open Settings on the 4K monitor (200 %) and the 1080p monitor (100 %), drag it between them: sharp, nothing cut off |
+| Microphone meter and status | – (no sound devices) | Settings open: the bar moves when you speak, status "Working" |
+| Mic muted in Windows | – | mute the mic in Sound settings: "Muted in Windows"; Unmute fixes it |
+| Mic hardware mute in Settings | – | the headset's mute switch on, speak: "No sound · check the mic's mute switch" after a few seconds |
+| Computer audio meter and test sound | – | press ▷: you hear a short chime, the bar moves, status "Working" |
+| Windows default names | – | the lists say "Windows default (JLAB TALK GO)" (your headset's name) |
+| Unplug the headset with Settings open | – | status "Not connected · trying again", back to "Working" after plugging in |
 | Installer | silent install, start, single copy, exit, uninstall | install, use, uninstall: recordings stay |
