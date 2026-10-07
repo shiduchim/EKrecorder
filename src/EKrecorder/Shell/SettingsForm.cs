@@ -526,6 +526,13 @@ internal sealed class SettingsForm : Form
 
     private void SetScale(float scale)
     {
+        if (Math.Abs(scale - _scale) < 0.001f)
+        {
+            // Already laid out at this scale. New fonts would not reach the controls either: a control keeps a font
+            // equal to the one it has, and that one would then be disposed.
+            return;
+        }
+
         _scale = scale;
         UiFonts old = _fonts;
         _fonts = new UiFonts(scale);
