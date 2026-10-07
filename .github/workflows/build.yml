@@ -170,11 +170,17 @@ jobs:
       # ask it to exit (as the installer does), then uninstall. Nothing may be left in Program Files or need admin rights.
       - name: Installer test (informational)
         continue-on-error: true
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $setup = (Get-ChildItem publish/installer -Filter 'EKrecorder-Setup-*.exe' | Select-Object -First 1).FullName
-          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER' -PassThru -Wait
+          # Waits for Setup itself only: a silent install starts EKrecorder in the tray, which keeps running
+          # (Start-Process -Wait would wait for it too).
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER' -PassThru
+          $p.WaitForExit()
           Write-Host "Setup exit code: $($p.ExitCode)"
+          Start-Sleep -Seconds 3
+          Write-Host "Running after the silent install: $(@(Get-Process -Name EKrecorder -ErrorAction SilentlyContinue).Count) process(es)"
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\EKrecorder\EKrecorder.exe'
           Write-Host "Installed at $installed : $(Test-Path $installed)"
           $uninstallKey = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' | Where-Object { $_.PSChildName -like '*7C1F0E2A*' }
