@@ -309,6 +309,7 @@ internal sealed class RecordingController : IDisposable
     /// <summary>The displays changed: the triangle follows the recorded monitor if it moved.</summary>
     public void OnDisplayChanged()
     {
+        _session?.NotifyDisplayChanged();
         if (_session is { CaptureLost: false } session && _indicator is not null)
         {
             MonitorInfo? moved = MonitorEnumerator.GetMonitors(log: false).FirstOrDefault(m => m.StableId == session.Monitor.StableId);

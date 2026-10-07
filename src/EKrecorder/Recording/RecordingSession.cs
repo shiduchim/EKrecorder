@@ -58,6 +58,8 @@ internal sealed unsafe class RecordingSession
     private static readonly Guid IID_IDirect3DDxgiInterfaceAccess = new("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
 
     private const long ReacquireInterval = 20_000_000; // look for a lost monitor every 2 s (100-ns units)
+    private const long LookInterval = 10_000_000; // 1 s between the looks that confirm what was found
+    private const long FirstFrameTimeout = 50_000_000; // 5 s for the first picture of a monitor that came back
 
     private readonly object _frameLock = new();
     private readonly ManualResetEventSlim _firstFrame = new(false);
@@ -82,7 +84,18 @@ internal sealed unsafe class RecordingSession
     private volatile bool _stopRequested;
     private volatile bool _itemClosed;
     private volatile bool _captureLost;
+    private volatile bool _displayChanged;
     private long _nextReacquire;
+    private IntPtr _capturedHandle;
+    private Task<IReadOnlyList<MonitorInfo>?>? _monitorLook; // a look at the monitors, done off the pacing thread
+    private MonitorInfo? _candidate; // the lost monitor as the previous look found it
+    private MonitorInfo? _confirming; // found again and captured, waiting for its first picture
+    private long _confirmFramesFrom;
+    private long _confirmDeadline;
+    private int _checksLeft; // looks still to do that the captured display shows the recorded monitor
+    private int _mismatches;
+    private long _nextCheck;
+    private int _forgetInputsIn; // ticks until the views of the old capture's textures are let go
 
     private RecordingSession(MonitorInfo monitor, RecordingPreset preset, string temporaryPath, string borderlessAccess, AudioSelection? audio, bool simulateFirstSetupFailure, bool allowFragmented)
     {
@@ -247,8 +260,8 @@ internal sealed unsafe class RecordingSession
                 Audio.Start();
             }
 
-            StartCapture(Monitor);
-            CaptureSize = new Size(_poolSize.Width, _poolSize.Height);
+            SizeInt32 captured = StartCapture(Monitor);
+            CaptureSize = new Size(captured.Width, captured.Height);
             OutputSize = Preset.OutputSizeFor(CaptureSize);
             Log.Decision($"Output size {OutputSize.Width}x{OutputSize.Height} for a {CaptureSize.Width}x{CaptureSize.Height} monitor "
                 + (OutputSize == CaptureSize ? "(no scaling)." : "(scaled down, aspect ratio kept, never upscaled)."));
@@ -784,14 +797,7 @@ internal sealed unsafe class RecordingSession
                     SampleResources(adapter3);
                 }
 
-                if (_itemClosed && !_captureLost)
-                {
-                    OnCaptureLost();
-                }
-                else if (_captureLost && TimelineClock.NowHns() >= _nextReacquire)
-                {
-                    TryReacquire();
-                }
+                WatchCapture(route);
             }
         }
         finally
@@ -927,65 +933,78 @@ internal sealed unsafe class RecordingSession
         }
     }
 
-    /// <summary>Starts capturing <paramref name="monitor"/> on this recording's GPU device.</summary>
-    private void StartCapture(MonitorInfo monitor)
+    /// <summary>The displays changed (WM_DISPLAYCHANGE): the recording checks that it still captures the recorded monitor.</summary>
+    public void NotifyDisplayChanged() => _displayChanged = true;
+
+    /// <summary>Starts capturing <paramref name="monitor"/> on this recording's GPU device; returns the monitor's size.</summary>
+    private SizeInt32 StartCapture(MonitorInfo monitor)
     {
         GraphicsCaptureItem item = CaptureItemFactory.CreateForMonitor(monitor.Handle);
         Direct3D11CaptureFramePool? pool = null;
         GraphicsCaptureSession? session = null;
         try
         {
+            SizeInt32 size = item.Size;
             item.Closed += OnItemClosed;
-            pool = Direct3D11CaptureFramePool.CreateFreeThreaded(_winrtDevice!, DirectXPixelFormat.B8G8R8A8UIntNormalized, PoolBuffers, item.Size);
+            pool = Direct3D11CaptureFramePool.CreateFreeThreaded(_winrtDevice!, DirectXPixelFormat.B8G8R8A8UIntNormalized, PoolBuffers, size);
             session = pool.CreateCaptureSession(item);
             CaptureSettings = CaptureSessionSetup.Configure(session, Preset.FramesPerSecond, _borderlessAccess).Describe();
-            _poolSize = item.Size;
+            _poolSize = size;
             pool.FrameArrived += OnFrameArrived;
             session.StartCapture();
             _item = item;
             _pool = pool;
             _captureSession = session;
+            _capturedHandle = monitor.Handle;
+            return size;
         }
         catch
         {
-            item.Closed -= OnItemClosed;
+            Quietly("Removing the Closed handler", () => item.Closed -= OnItemClosed);
             if (pool is not null)
             {
-                pool.FrameArrived -= OnFrameArrived;
+                Quietly("Removing the frame handler", () => pool.FrameArrived -= OnFrameArrived);
             }
 
-            session?.Dispose();
-            pool?.Dispose();
+            Quietly("Closing the capture session", () => session?.Dispose());
+            Quietly("Closing the frame pool", () => pool?.Dispose());
             throw;
         }
     }
 
-    /// <summary>Stops the capture (never throws). The frame already held stays usable.</summary>
+    /// <summary>Stops the capture (never throws; each step on its own). The frame already held stays usable.</summary>
     private void StopCapture()
     {
-        try
-        {
-            if (_pool is not null)
-            {
-                _pool.FrameArrived -= OnFrameArrived;
-            }
-
-            if (_item is not null)
-            {
-                _item.Closed -= OnItemClosed;
-            }
-
-            _captureSession?.Dispose();
-            _pool?.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Log.Error("Stopping the capture failed", ex);
-        }
-
+        Direct3D11CaptureFramePool? pool = _pool;
+        GraphicsCaptureItem? item = _item;
+        GraphicsCaptureSession? session = _captureSession;
         _captureSession = null;
         _pool = null;
         _item = null;
+        if (pool is not null)
+        {
+            Quietly("Removing the frame handler", () => pool.FrameArrived -= OnFrameArrived);
+        }
+
+        if (item is not null)
+        {
+            Quietly("Removing the Closed handler", () => item.Closed -= OnItemClosed);
+        }
+
+        Quietly("Closing the capture session", () => session?.Dispose());
+        Quietly("Closing the frame pool", () => pool?.Dispose());
+    }
+
+    private static void Quietly(string what, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"{what} failed", ex);
+        }
     }
 
     private void OnItemClosed(GraphicsCaptureItem sender, object args)
@@ -994,44 +1013,127 @@ internal sealed unsafe class RecordingSession
         Log.Warn("GraphicsCaptureItem.Closed: the recorded monitor is gone (unplugged, switched off or asleep).");
     }
 
+    /// <summary>
+    /// Runs on the pacing thread after every frame: notices a lost monitor, looks for it until it is back, and after a
+    /// display change checks that the captured display still shows the recorded monitor. Looking at the monitors
+    /// happens off this thread (it can block while Windows rearranges the displays).
+    /// </summary>
+    private void WatchCapture(Route route)
+    {
+        long now = TimelineClock.NowHns();
+        if (_forgetInputsIn > 0 && --_forgetInputsIn == 0)
+        {
+            // The old capture's textures are no longer shown; their cached views would keep them in video memory.
+            route.Gpu?.ForgetInputs();
+        }
+
+        if (_confirming is { } found)
+        {
+            ConfirmReacquired(found, now);
+            return;
+        }
+
+        if (_itemClosed && !_captureLost)
+        {
+            OnCaptureLost("The recorded monitor disappeared");
+            return;
+        }
+
+        if (_displayChanged)
+        {
+            _displayChanged = false;
+            if (!_captureLost)
+            {
+                StartChecks(now);
+            }
+        }
+
+        if (_monitorLook is { } look)
+        {
+            if (!look.IsCompleted)
+            {
+                return;
+            }
+
+            _monitorLook = null;
+            if (look.IsCompletedSuccessfully && look.Result is { } monitors)
+            {
+                if (_captureLost)
+                {
+                    TryReacquire(monitors, now);
+                }
+                else
+                {
+                    CheckCapturedMonitor(monitors, now);
+                }
+            }
+
+            return;
+        }
+
+        bool due = _captureLost ? now >= _nextReacquire : _checksLeft > 0 && now >= _nextCheck;
+        if (due)
+        {
+            _monitorLook = Task.Run(LookAtMonitors);
+        }
+    }
+
+    private static IReadOnlyList<MonitorInfo>? LookAtMonitors()
+    {
+        try
+        {
+            return MonitorEnumerator.GetMonitors(log: false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Looking at the monitors failed", ex);
+            return null;
+        }
+    }
+
     /// <summary>The monitor is gone: the recording goes on with the last picture, and the monitor is looked for.</summary>
-    private void OnCaptureLost()
+    private void OnCaptureLost(string what)
     {
         _captureLost = true;
         CaptureLosses++;
-        Stats.AddError("The recorded monitor disappeared; the picture held its last frame until it was back. Sound kept recording.");
-        Log.Decision($"{Monitor.Name} ({Monitor.FriendlyName}) is gone. Recording goes on with the last picture; looking for the same monitor every 2 s.");
+        _candidate = null;
+        _checksLeft = 0;
+        _mismatches = 0;
+        Stats.AddError($"{what}; the picture held its last frame until it was back. Sound kept recording.");
+        Log.Decision($"{what}: {Monitor.Name} ({Monitor.FriendlyName}). Recording goes on with the last picture; looking for the same monitor every 2 s.");
         StopCapture();
         _nextReacquire = TimelineClock.NowHns() + (ReacquireInterval / 2);
     }
 
-    /// <summary>Looks for the same physical monitor (by its stable identity) and captures it again if it is back.</summary>
-    private void TryReacquire()
+    /// <summary>
+    /// The same physical monitor (by its stable identity), found the same way in two looks in a row (Windows may
+    /// still be rearranging the displays when it comes back), is captured again.
+    /// </summary>
+    private void TryReacquire(IReadOnlyList<MonitorInfo> monitors, long now)
     {
-        _nextReacquire = TimelineClock.NowHns() + ReacquireInterval;
-        MonitorInfo? monitor;
-        try
-        {
-            monitor = MonitorEnumerator.GetMonitors(log: false).FirstOrDefault(m => m.StableId == Monitor.StableId);
-        }
-        catch (Exception ex)
-        {
-            Log.Error("Looking for the recorded monitor failed", ex);
-            return;
-        }
-
+        _nextReacquire = now + ReacquireInterval;
+        MonitorInfo? monitor = monitors.FirstOrDefault(IsRecordedMonitor);
         if (monitor is null)
         {
+            _candidate = null;
             return;
         }
 
+        if (_candidate is not { } before || !SameLook(before, monitor))
+        {
+            _candidate = monitor;
+            _nextReacquire = now + LookInterval;
+            return;
+        }
+
+        _candidate = null;
         try
         {
             _itemClosed = false;
+            _confirmFramesFrom = Stats.CaptureFrames;
             StartCapture(monitor);
-            CurrentMonitor = monitor;
-            _captureLost = false;
-            Log.Info($"The recorded monitor is back: {monitor.Summary}. Capturing it again.");
+            _confirming = monitor;
+            _confirmDeadline = now + FirstFrameTimeout;
         }
         catch (Exception ex)
         {
@@ -1039,6 +1141,85 @@ internal sealed unsafe class RecordingSession
             Log.Error($"{monitor.Name} is back but could not be captured yet; trying again in 2 s", ex);
         }
     }
+
+    /// <summary>The monitor counts as back once its first picture arrives; until then the recording holds the last one.</summary>
+    private void ConfirmReacquired(MonitorInfo found, long now)
+    {
+        if (Stats.CaptureFrames > _confirmFramesFrom)
+        {
+            _confirming = null;
+            CurrentMonitor = found;
+            _captureLost = false;
+            _forgetInputsIn = 2;
+            Log.Info($"The recorded monitor is back: {found.Summary}. Capturing it again.");
+            StartChecks(now);
+            return;
+        }
+
+        if (_itemClosed || now >= _confirmDeadline)
+        {
+            Log.Warn(_itemClosed
+                ? $"{found.Name} went away again before its first picture; still looking for it."
+                : $"No picture came from {found.Name} within 5 s; trying again.");
+            _confirming = null;
+            StopCapture();
+            _nextReacquire = now + ReacquireInterval;
+        }
+    }
+
+    private void StartChecks(long now)
+    {
+        _checksLeft = 3;
+        _mismatches = 0;
+        _nextCheck = now + LookInterval;
+    }
+
+    /// <summary>
+    /// After a display change: the captured display must still show the recorded monitor. Two looks in a row that
+    /// say it shows another monitor count as losing it (then the recorded one is looked for and captured again).
+    /// </summary>
+    private void CheckCapturedMonitor(IReadOnlyList<MonitorInfo> monitors, long now)
+    {
+        _checksLeft--;
+        _nextCheck = now + LookInterval;
+        MonitorInfo? shown = monitors.FirstOrDefault(m => m.Handle == _capturedHandle);
+        if (shown is null)
+        {
+            // That display is gone: Windows closes the capture (and the recording notices).
+            return;
+        }
+
+        if (IsRecordedMonitor(shown))
+        {
+            _mismatches = 0;
+            if (shown.Bounds != CurrentMonitor.Bounds || shown.Dpi != CurrentMonitor.Dpi)
+            {
+                CurrentMonitor = shown;
+            }
+
+            return;
+        }
+
+        if (++_mismatches < 2)
+        {
+            _checksLeft = Math.Max(_checksLeft, 1);
+            return;
+        }
+
+        OnCaptureLost($"The captured display now shows {shown.Summary}, not the recorded monitor");
+    }
+
+    /// <summary>
+    /// The recorded monitor, by its stable identity. When Windows gave no device path for it (the identity is then
+    /// only the display name, which another monitor can take over), its name and size must match too.
+    /// </summary>
+    private bool IsRecordedMonitor(MonitorInfo candidate) =>
+        candidate.StableId == Monitor.StableId
+        && (!Monitor.StableId.StartsWith(@"\\.\", StringComparison.Ordinal)
+            || (candidate.FriendlyName == Monitor.FriendlyName && candidate.Bounds.Size == Monitor.Bounds.Size));
+
+    private static bool SameLook(MonitorInfo a, MonitorInfo b) =>
+        a.Handle == b.Handle && a.StableId == b.StableId && a.GdiDeviceName == b.GdiDeviceName && a.Bounds == b.Bounds;
 
     /// <summary>Runs on a capture thread for every captured frame: keeps the newest one, lets go of the one before.</summary>
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
@@ -1089,6 +1270,10 @@ internal sealed unsafe class RecordingSession
 
             replaced?.Dispose();
             _firstFrame.Set();
+        }
+        catch (ObjectDisposedException) when (!ReferenceEquals(sender, _pool))
+        {
+            // The capture was stopped while this frame came in.
         }
         catch (Exception ex)
         {

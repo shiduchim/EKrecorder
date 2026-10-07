@@ -136,6 +136,9 @@ internal sealed unsafe class GpuFrameConverter : IDisposable
     /// </summary>
     public void CheckTarget(ID3D11Texture2D* target, uint targetSubresource) => OutputViewFor(target, targetSubresource);
 
+    /// <summary>The capture was replaced: the views of its textures are let go (each view keeps its texture in video memory).</summary>
+    public void ForgetInputs() => ReleaseViews(_inputViews);
+
     public void Dispose()
     {
         ReleaseProcessor();
