@@ -116,16 +116,20 @@ jobs:
             $value = if ($theme -eq 'dark') { 0 } else { 1 }
             Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value $value -Type DWord
             Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value $value -Type DWord
-            $out = Join-Path $env:RUNNER_TEMP "screenshots\$theme"
-            $p = Start-Process -FilePath $exe -ArgumentList @('--screenshot', '--output', "`"$out`"") -PassThru
-            $null = $p.Handle
-            if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force }
-            $b64 = Join-Path $out 'settings.png.base64.txt'
-            if (Test-Path $b64) {
-              Write-Host "BEGIN-PNG $theme"
-              Write-Host (Get-Content $b64 -Raw)
-              Write-Host "END-PNG $theme"
-            } else { Write-Host "No $theme screenshot." }
+            foreach ($scale in '1', '2') {
+              $name = "$theme-$($scale)00"
+              $out = Join-Path $env:RUNNER_TEMP "screenshots\$name"
+              $p = Start-Process -FilePath $exe -ArgumentList @('--screenshot', '--output', "`"$out`"", '--scale', $scale) -PassThru
+              $null = $p.Handle
+              if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force }
+              Get-ChildItem $out -Filter 'selftest-*-report.txt' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName | Write-Host }
+              $b64 = Join-Path $out 'settings.png.base64.txt'
+              if (Test-Path $b64) {
+                Write-Host "BEGIN-PNG $name"
+                Write-Host (Get-Content $b64 -Raw)
+                Write-Host "END-PNG $name"
+              } else { Write-Host "No $name screenshot." }
+            }
           }
           Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 1 -Type DWord
 

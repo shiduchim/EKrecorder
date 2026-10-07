@@ -162,8 +162,11 @@ internal static class Program
             mode == "record" ? Timeout.InfiniteTimeSpan : TimeSpan.FromMinutes(8),
             Timeout.InfiniteTimeSpan);
 
+        // --scale 2 lays the Settings window out as at 200 % (the build machine's monitor is at 100 %).
+        float? scale = float.TryParse(ArgumentValue(args, "--scale"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float forced)
+            && forced is >= 1 and <= 4 ? forced : null;
         int exitCode;
-        using (var test = new SelfTest(mode, output))
+        using (var test = new SelfTest(mode, output, scale))
         {
             Application.Run(test);
             exitCode = test.ExitCode;

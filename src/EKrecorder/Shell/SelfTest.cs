@@ -20,7 +20,8 @@ namespace EKrecorder.Shell;
 /// global shortcut.</item>
 /// <item><c>record</c>: starts recording and never stops (the build machine kills the process).</item>
 /// <item><c>recover</c>: what the next start does after that kill: finds and recovers the recording.</item>
-/// <item><c>screenshot</c>: the Settings window as a picture (light or dark, as Windows is set).</item>
+/// <item><c>screenshot</c>: the Settings window as a picture (light or dark, as Windows is set; at 200 % with
+/// <c>--scale 2</c>), and a check that nothing in it is cut off or overlaps.</item>
 /// </list>
 /// Results go to selftest-*-report.txt; the exit code is 0 when everything passed.
 /// </summary>
@@ -30,10 +31,12 @@ internal sealed class SelfTest : ApplicationContext
     private readonly string _output;
     private readonly AppPaths _paths;
     private readonly StringBuilder _report = new();
+    private readonly float? _scale;
     private int _failures;
 
-    public SelfTest(string mode, string output)
+    public SelfTest(string mode, string output, float? scale = null)
     {
+        _scale = scale;
         if (SynchronizationContext.Current is null)
         {
             SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
@@ -302,7 +305,7 @@ internal sealed class SelfTest : ApplicationContext
         }
     }
 
-    /// <summary>The Settings window as a picture, with this machine's monitors and devices.</summary>
+    /// <summary>The Settings window as a picture, with this machine's monitors and devices, and a check of its layout.</summary>
     private async Task ScreenshotAsync()
     {
         IReadOnlyList<MonitorInfo> monitors = MonitorEnumerator.GetMonitors();
@@ -310,25 +313,28 @@ internal sealed class SelfTest : ApplicationContext
         using var hotkeys = new HotkeyManager(window.Handle);
         var settings = new AppSettings { MonitorId = monitors.FirstOrDefault()?.StableId, MonitorName = monitors.FirstOrDefault()?.FriendlyName };
         using var form = new SettingsForm(settings, monitors, hotkeys, _ => null, _ => { });
+        if (_scale is { } scale)
+        {
+            form.ForceScale(scale);
+        }
+
         form.StartPosition = FormStartPosition.Manual;
         form.Location = new Point(20, 20);
         form.Show();
         await form.LoadDevicesAsync();
-        await Task.Delay(800);
+        await Task.Delay(1500); // the audio preview has looked for devices by now
         form.Activate();
-        await Task.Delay(400);
-        Rectangle bounds = form.Bounds;
-        using var bitmap = new Bitmap(bounds.Width, bounds.Height);
-        using (Graphics g = Graphics.FromImage(bitmap))
-        {
-            g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
-        }
-
+        await Task.Delay(300);
+        using Bitmap bitmap = form.RenderContent();
         Directory.CreateDirectory(_output);
         string png = Path.Combine(_output, "settings.png");
         bitmap.Save(png, ImageFormat.Png);
         File.WriteAllText(Path.Combine(_output, "settings.png.base64.txt"), Convert.ToBase64String(File.ReadAllBytes(png)));
-        Result("Settings window shown", true, Invariant($"{bounds.Width}x{bounds.Height} at {form.DeviceDpi} DPI"));
+        IReadOnlyList<string> problems = form.CheckLayout();
+        Result(
+            Invariant($"Settings window laid out at {(_scale ?? form.DeviceDpi / 96f) * 100:0} %"),
+            problems.Count == 0,
+            problems.Count == 0 ? Invariant($"{bitmap.Width}x{bitmap.Height}, nothing cut off or overlapping") : string.Join("; ", problems));
         form.Close();
     }
 

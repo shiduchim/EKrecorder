@@ -112,11 +112,14 @@ internal static class AppIcons
 /// A slider with a few labelled steps (480p ... 4K, 96 ... 256 kbps). Drawn by itself so it looks the same in
 /// light and dark mode. Mouse: click or drag. Keyboard: arrows, Home, End.
 /// </summary>
-internal sealed class StepSlider : Control
+internal sealed class StepSlider : Control, IThemed
 {
     private string[] _labels = [];
     private int _value = 1;
     private bool _dragging;
+    private UiTheme? _theme;
+    private UiFonts? _fonts;
+    private float _scale = 1;
 
     public StepSlider()
     {
@@ -164,6 +167,18 @@ internal sealed class StepSlider : Control
     }
 
     protected override Size DefaultSize => new(360, 48);
+
+    /// <summary>The height the track and the step names need.</summary>
+    public int NeededHeight => _fonts is null ? Height : (int)Math.Ceiling(Px(12) + Px(8) + Px(6) + _fonts.CaptionStrong.Height + Px(2));
+
+    public void ApplyTheme(UiTheme theme, UiFonts fonts, float scale)
+    {
+        _theme = theme;
+        _fonts = fonts;
+        _scale = scale;
+        BackColor = theme.Card;
+        Invalidate();
+    }
 
     protected override bool IsInputKey(Keys keyData) =>
         (keyData & Keys.KeyCode) is Keys.Left or Keys.Right or Keys.Up or Keys.Down or Keys.Home or Keys.End || base.IsInputKey(keyData);
@@ -241,14 +256,19 @@ internal sealed class StepSlider : Control
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (_theme is null || _fonts is null)
+        {
+            return;
+        }
+
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         int steps = Math.Max(1, _labels.Length);
         float trackY = Px(12);
         float thumbRadius = Px(8);
         float trackHeight = Px(4);
-        Color accent = Enabled ? SystemColors.Highlight : SystemColors.GrayText;
-        Color rail = Blend(SystemColors.ControlText, BackColor, 0.25);
+        Color accent = Enabled ? _theme.Accent : _theme.DisabledText;
+        Color rail = _theme.Rail;
 
         float first = X(1);
         float last = X(steps);
@@ -267,50 +287,55 @@ internal sealed class StepSlider : Control
                 g.FillPath(accentBrush, done);
             }
 
-            float tick = Px(3);
+            float tick = Px(2.5f);
             for (int step = 1; step <= steps; step++)
             {
                 using var tickBrush = new SolidBrush(step <= _value ? accent : rail);
                 g.FillEllipse(tickBrush, X(step) - tick, trackY - tick, 2 * tick, 2 * tick);
             }
-
-            g.FillEllipse(accentBrush, selected - thumbRadius, trackY - thumbRadius, 2 * thumbRadius, 2 * thumbRadius);
         }
 
-        using (var inner = new SolidBrush(BackColor))
+        // The thumb as Windows 11 draws it: a ring in the control colour around an accent dot.
+        using (var ring = new SolidBrush(_theme.Control))
+        using (var ringBorder = new Pen(_theme.ControlBorder, Math.Max(1, _scale)))
         {
-            float hole = thumbRadius * 0.45f;
-            g.FillEllipse(inner, selected - hole, trackY - hole, 2 * hole, 2 * hole);
+            g.FillEllipse(ring, selected - thumbRadius, trackY - thumbRadius, 2 * thumbRadius, 2 * thumbRadius);
+            g.DrawEllipse(ringBorder, selected - thumbRadius, trackY - thumbRadius, 2 * thumbRadius, 2 * thumbRadius);
+        }
+
+        using (var dot = new SolidBrush(accent))
+        {
+            float inner = thumbRadius * 0.55f;
+            g.FillEllipse(dot, selected - inner, trackY - inner, 2 * inner, 2 * inner);
         }
 
         if (Focused && ShowFocusCues)
         {
-            using var pen = new Pen(accent, Math.Max(1, Px(1.5f))) { DashStyle = DashStyle.Dot };
+            using var pen = new Pen(_theme.Text, Math.Max(1, Px(2)));
             float ring = thumbRadius + Px(3);
             g.DrawEllipse(pen, selected - ring, trackY - ring, 2 * ring, 2 * ring);
         }
 
-        using var bold = new Font(Font, FontStyle.Bold);
         for (int step = 1; step <= steps; step++)
         {
             string label = _labels[step - 1];
             bool current = step == _value;
-            Font font = current ? bold : Font;
-            Size size = TextRenderer.MeasureText(g, label, font);
+            Font font = current ? _fonts.CaptionStrong : _fonts.Caption;
+            Size size = TextRenderer.MeasureText(g, label, font, Size.Empty, TextFormatFlags.NoPadding);
             int x = (int)Math.Round(X(step) - (size.Width / 2f));
             x = Math.Clamp(x, 0, Math.Max(0, Width - size.Width));
-            Color color = !Enabled ? SystemColors.GrayText : current ? SystemColors.ControlText : Blend(SystemColors.ControlText, BackColor, 0.6);
-            TextRenderer.DrawText(g, label, font, new Point(x, (int)(trackY + thumbRadius + Px(4))), color, TextFormatFlags.NoPadding);
+            Color color = !Enabled ? _theme.DisabledText : current ? _theme.Text : _theme.SecondaryText;
+            TextRenderer.DrawText(g, label, font, new Point(x, (int)(trackY + thumbRadius + Px(6))), color, TextFormatFlags.NoPadding);
         }
     }
 
-    private float Px(float logical) => logical * DeviceDpi / 96f;
+    private float Px(float logical) => logical * _scale;
 
     /// <summary>The centre of a step; the end steps sit far enough in for their labels.</summary>
     private float X(int step)
     {
         int steps = Math.Max(1, _labels.Length);
-        float margin = Px(22);
+        float margin = Px(20);
         return steps == 1 ? Width / 2f : margin + ((Width - (2 * margin)) * (step - 1) / (steps - 1));
     }
 
@@ -331,10 +356,6 @@ internal sealed class StepSlider : Control
         return best;
     }
 
-    private static Color Blend(Color a, Color b, double amountOfA) => Color.FromArgb(
-        (int)((a.R * amountOfA) + (b.R * (1 - amountOfA))),
-        (int)((a.G * amountOfA) + (b.G * (1 - amountOfA))),
-        (int)((a.B * amountOfA) + (b.B * (1 - amountOfA))));
 }
 
 /// <summary>

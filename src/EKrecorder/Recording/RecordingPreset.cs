@@ -69,8 +69,11 @@ internal static class RecordingQuality
     public const int FramesPerSecond = 30;
     public const int KeyframeIntervalSeconds = 2;
 
-    /// <summary>1440p: on a 4K screen Revit lines and small text stay sharp; a 1080p screen is recorded at full size with room to spare.</summary>
-    public const int DefaultVideoLevel = 4;
+    /// <summary>
+    /// 4K: a 4K screen is recorded at its full size, so Revit's thin lines and small text are as sharp as on the screen;
+    /// a smaller screen is recorded at its own size with the bitrate of its size (see <see cref="Preset(int, int, Size)"/>).
+    /// </summary>
+    public const int DefaultVideoLevel = 5;
 
     /// <summary>128 kbps: plenty for voices on calls.</summary>
     public const int DefaultAudioLevel = 2;
@@ -81,7 +84,8 @@ internal static class RecordingQuality
         new(2, "720p", 1280, 720, 2_500_000, 6_000_000),
         new(3, "1080p", 1920, 1080, 4_000_000, 10_000_000),
         new(4, "1440p", 2560, 1440, 6_000_000, 14_000_000),
-        new(5, "4K", 3840, 2160, 10_000_000, 20_000_000),
+        // A drawing that pans or scrolls changes the whole 4K picture at once; the peak leaves room for that.
+        new(5, "4K", 3840, 2160, 12_000_000, 30_000_000),
     ];
 
     public static IReadOnlyList<AudioLevel> Audio { get; } =
@@ -105,7 +109,21 @@ internal static class RecordingQuality
             $"{video.Label}, {FramesPerSecond} fps", video.MaxWidth, video.MaxHeight, FramesPerSecond, video.AverageBitrate, video.PeakBitrate, KeyframeIntervalSeconds, audio.Bitrate);
     }
 
-    /// <summary>About how much an hour takes at most (the bitrates are averages; a still screen takes less).</summary>
-    public static double GigabytesPerHour(int videoLevel, int audioLevel) =>
-        (VideoLevelOf(videoLevel).AverageBitrate + AudioLevelOf(audioLevel).Bitrate) / 8.0 * 3600 / 1e9;
+    /// <summary>
+    /// The preset for recording a monitor of size <paramref name="monitor"/> at this step. A step larger than the
+    /// monitor records it at its own size, with the bitrates of the smallest step that holds that picture: a 1080p
+    /// monitor at the 4K step is recorded like the 1080p step (the same picture, not a bigger file).
+    /// </summary>
+    public static RecordingPreset Preset(int videoLevel, int audioLevel, Size monitor)
+    {
+        RecordingPreset preset = Preset(videoLevel, audioLevel);
+        Size output = preset.OutputSizeFor(monitor);
+        long pixels = (long)output.Width * output.Height;
+        VideoLevel chosen = VideoLevelOf(videoLevel);
+        VideoLevel rates = Video.First(v => v.Level == chosen.Level || (long)v.MaxWidth * v.MaxHeight >= pixels);
+        return rates.Level == chosen.Level ? preset : preset with { AverageBitrate = rates.AverageBitrate, PeakBitrate = rates.PeakBitrate };
+    }
+
+    /// <summary>About how much an hour of <paramref name="preset"/> takes at most (the bitrates are averages; a still screen takes less).</summary>
+    public static double GigabytesPerHour(RecordingPreset preset) => (preset.AverageBitrate + preset.AudioBitrate) / 8.0 * 3600 / 1e9;
 }

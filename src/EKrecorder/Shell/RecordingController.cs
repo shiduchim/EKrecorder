@@ -138,7 +138,6 @@ internal sealed class RecordingController : IDisposable
         try
         {
             AppSettings settings = _settings();
-            RecordingPreset preset = RecordingQuality.Preset(settings.VideoQuality, settings.AudioQuality);
             _maxHours = settings.MaxRecordingHours; // a change in Settings applies to the next recording
             (MonitorInfo? monitor, string? substitute) = ChooseMonitor(settings);
             if (monitor is null)
@@ -147,6 +146,8 @@ internal sealed class RecordingController : IDisposable
                 SetState(RecorderState.Idle);
                 return;
             }
+
+            RecordingPreset preset = RecordingQuality.Preset(settings.VideoQuality, settings.AudioQuality, monitor.Bounds.Size);
 
             Directory.CreateDirectory(_paths.InProgress);
             long free = FreeSpace(_paths.InProgress);

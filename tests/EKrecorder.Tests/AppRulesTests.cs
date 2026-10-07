@@ -86,7 +86,7 @@ public sealed class SettingsTests : IDisposable
         (AppSettings settings, bool existed, string? problem) = store.Load();
         Assert.False(existed);
         Assert.Null(problem);
-        Assert.Equal(4, settings.VideoQuality);
+        Assert.Equal(5, settings.VideoQuality);
         Assert.Equal(2, settings.AudioQuality);
         Assert.True(settings.StartWithWindows);
         Assert.Equal(0, settings.MaxRecordingHours);
@@ -252,7 +252,7 @@ public sealed class RecordingQualityTests
     {
         Assert.Equal((4_000_000, 10_000_000), (RecordingQuality.Video[2].AverageBitrate, RecordingQuality.Video[2].PeakBitrate));
         Assert.Equal((6_000_000, 14_000_000), (RecordingQuality.Video[3].AverageBitrate, RecordingQuality.Video[3].PeakBitrate));
-        Assert.Equal((10_000_000, 20_000_000), (RecordingQuality.Video[4].AverageBitrate, RecordingQuality.Video[4].PeakBitrate));
+        Assert.Equal((12_000_000, 30_000_000), (RecordingQuality.Video[4].AverageBitrate, RecordingQuality.Video[4].PeakBitrate));
     }
 
     [Fact]
@@ -261,6 +261,25 @@ public sealed class RecordingQualityTests
         // Windows' AAC encoder takes 96, 128, 160, 192, 256 and 320 kbps for 48 kHz stereo (measured on the build machine).
         Assert.Equal([96_000, 128_000, 160_000, 192_000, 256_000], RecordingQuality.Audio.Select(a => a.Bitrate));
         Assert.Equal(128_000, RecordingPreset.Default.AudioBitrate);
+    }
+
+    [Theory]
+    [InlineData(5, 3840, 2160, 12_000_000, 30_000_000)]
+    [InlineData(5, 3440, 1440, 12_000_000, 30_000_000)]
+    [InlineData(5, 2560, 1440, 6_000_000, 14_000_000)]
+    [InlineData(5, 1920, 1080, 4_000_000, 10_000_000)]
+    [InlineData(5, 1080, 1920, 4_000_000, 10_000_000)]
+    [InlineData(4, 1920, 1080, 4_000_000, 10_000_000)]
+    [InlineData(4, 3840, 2160, 6_000_000, 14_000_000)]
+    [InlineData(3, 3840, 2160, 4_000_000, 10_000_000)]
+    [InlineData(3, 1366, 768, 4_000_000, 10_000_000)]
+    [InlineData(1, 3840, 2160, 1_200_000, 3_000_000)]
+    public void AStepLargerThanTheMonitorUsesTheBitrateOfItsSize(int level, int width, int height, int average, int peak)
+    {
+        RecordingPreset preset = RecordingQuality.Preset(level, 2, new Size(width, height));
+        Assert.Equal((average, peak), (preset.AverageBitrate, preset.PeakBitrate));
+        Assert.Equal(RecordingQuality.Preset(level, 2).Name, preset.Name);
+        Assert.Equal(RecordingQuality.Preset(level, 2).OutputSizeFor(new Size(width, height)), preset.OutputSizeFor(new Size(width, height)));
     }
 
     [Theory]
