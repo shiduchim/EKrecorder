@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
+using System.Windows.Forms.Automation;
 
 namespace EKrecorder.Shell;
 
@@ -286,6 +287,18 @@ internal sealed class MonitorPicker : Control, IThemed
             _selectedId = value;
             AccessibleDescription = _monitors.FirstOrDefault(m => m.Id == value)?.Description;
             Invalidate();
+            int index = SelectedIndex();
+            if (IsHandleCreated && index >= 0)
+            {
+                // Narrator hears which monitor the arrow keys picked.
+                AccessibilityNotifyClients(AccessibleEvents.Selection, index);
+                if (Focused)
+                {
+                    AccessibilityNotifyClients(AccessibleEvents.Focus, index);
+                    AccessibilityObject.RaiseAutomationNotification(AutomationNotificationKind.ActionCompleted, AutomationNotificationProcessing.MostRecent, _monitors[index].Description);
+                }
+            }
+
             SelectionChanged?.Invoke(this, EventArgs.Empty);
         }
     }
@@ -312,13 +325,16 @@ internal sealed class MonitorPicker : Control, IThemed
     protected override bool IsInputKey(Keys keyData) =>
         (keyData & Keys.KeyCode) is Keys.Left or Keys.Right or Keys.Up or Keys.Down or Keys.Home or Keys.End || base.IsInputKey(keyData);
 
+    protected override AccessibleObject CreateAccessibilityInstance() => new PickerAccessibleObject(this);
+
     protected override void OnKeyDown(KeyEventArgs e)
     {
         int index = SelectedIndex();
         int next = e.KeyCode switch
         {
-            Keys.Left or Keys.Up => index - 1,
-            Keys.Right or Keys.Down => index + 1,
+            // With nothing chosen yet (the saved monitor is gone), any arrow starts at the first monitor.
+            Keys.Left or Keys.Up => index < 0 ? 0 : index - 1,
+            Keys.Right or Keys.Down => index < 0 ? 0 : index + 1,
             Keys.Home => 0,
             Keys.End => _monitors.Count - 1,
             _ => -2,
@@ -427,8 +443,18 @@ internal sealed class MonitorPicker : Control, IThemed
                 TextRenderer.DrawText(g, monitor.Number, _fonts.Strong, area, text, fill, centre | TextFormatFlags.VerticalCenter);
             }
         }
+
+        if (Focused && ShowFocusCues && SelectedIndex() < 0)
+        {
+            // Nothing chosen yet: the ring goes round the whole picture, so the keyboard focus can be seen.
+            float inset = 1 * _scale;
+            using GraphicsPath focus = Glyphs.Rounded(new RectangleF(inset, inset, Width - (2 * inset) - 1, Height - (2 * inset) - 1), (int)Math.Round(6 * _scale));
+            using var pen = new Pen(_theme.Text, Math.Max(1, 2 * _scale));
+            g.DrawPath(pen, focus);
+        }
     }
 
+    /// <summary>The chosen monitor's position in <see cref="Monitors"/>, or -1 when none is chosen.</summary>
     private int SelectedIndex()
     {
         for (int i = 0; i < _monitors.Count; i++)
@@ -439,7 +465,7 @@ internal sealed class MonitorPicker : Control, IThemed
             }
         }
 
-        return 0;
+        return -1;
     }
 
     private int HitTest(Point point)
@@ -486,6 +512,78 @@ internal sealed class MonitorPicker : Control, IThemed
 
     /// <summary>One monitor: its id, its number, where it is on the desktop, its resolution class ("4K") and its name for the tooltip.</summary>
     internal sealed record Choice(string Id, string Number, Rectangle Bounds, string Resolution, string Description);
+
+    /// <summary>The picture as a list of monitors for Narrator and Voice Access: each one can be read and chosen.</summary>
+    private sealed class PickerAccessibleObject(MonitorPicker owner) : ControlAccessibleObject(owner)
+    {
+        public override string? Value => owner.SelectedIndex() is int i and >= 0 ? owner._monitors[i].Description : "None chosen";
+
+        public override int GetChildCount() => owner._monitors.Count;
+
+        public override AccessibleObject? GetChild(int index) =>
+            index >= 0 && index < owner._monitors.Count ? new MonitorAccessibleObject(owner, this, index) : null;
+
+        public override AccessibleObject? GetSelected() => owner.SelectedIndex() is int i and >= 0 ? GetChild(i) : null;
+
+        public override AccessibleObject? GetFocused() => owner.Focused ? GetSelected() ?? this : null;
+    }
+
+    private sealed class MonitorAccessibleObject(MonitorPicker owner, AccessibleObject parent, int index) : AccessibleObject
+    {
+        public override string? Name => index < owner._monitors.Count ? owner._monitors[index].Description : null;
+
+        public override AccessibleRole Role => AccessibleRole.ListItem;
+
+        public override AccessibleObject? Parent => parent;
+
+        public override AccessibleStates State
+        {
+            get
+            {
+                AccessibleStates state = AccessibleStates.Selectable | AccessibleStates.Focusable;
+                if (index == owner.SelectedIndex())
+                {
+                    state |= AccessibleStates.Selected | (owner.Focused ? AccessibleStates.Focused : 0);
+                }
+
+                return state;
+            }
+        }
+
+        public override Rectangle Bounds
+        {
+            get
+            {
+                List<RectangleF> boxes = owner.Boxes();
+                return index < boxes.Count && owner.IsHandleCreated ? owner.RectangleToScreen(Rectangle.Round(boxes[index])) : Rectangle.Empty;
+            }
+        }
+
+        public override string DefaultAction => "Choose";
+
+        public override void DoDefaultAction() => Choose();
+
+        public override void Select(AccessibleSelection flags)
+        {
+            if ((flags & (AccessibleSelection.TakeSelection | AccessibleSelection.AddSelection)) != 0)
+            {
+                Choose();
+            }
+
+            if ((flags & AccessibleSelection.TakeFocus) != 0)
+            {
+                owner.Focus();
+            }
+        }
+
+        private void Choose()
+        {
+            if (index < owner._monitors.Count)
+            {
+                owner.SelectedId = owner._monitors[index].Id;
+            }
+        }
+    }
 }
 
 /// <summary>
@@ -510,6 +608,7 @@ internal sealed class LevelMeter : Control, IThemed
     public LevelMeter()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false); // the arrow keys pass it by
         TabStop = false;
         AccessibleRole = AccessibleRole.ProgressBar;
     }
@@ -634,6 +733,7 @@ internal sealed class StatusLine : Control, IThemed
     public StatusLine()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false); // the arrow keys pass it by (its link can still be chosen)
         TabStop = false;
         AccessibleRole = AccessibleRole.StaticText;
         Link.Style = PillStyle.Link;
@@ -652,6 +752,7 @@ internal sealed class StatusLine : Control, IThemed
             return;
         }
 
+        bool changed = Text != text;
         Text = text;
         AccessibleName = text;
         _color = color;
@@ -660,6 +761,12 @@ internal sealed class StatusLine : Control, IThemed
         Link.Visible = link.Length > 0;
         PlaceLink();
         Invalidate();
+        if (changed && text.Length > 0 && _theme is not null && color is { } shown && (shown == _theme.Warning || shown == _theme.Error)
+            && IsHandleCreated && FindForm() is { ContainsFocus: true })
+        {
+            // A problem is said out loud once (the line itself cannot take the focus).
+            AccessibilityObject.RaiseAutomationNotification(AutomationNotificationKind.Other, AutomationNotificationProcessing.ImportantMostRecent, text);
+        }
     }
 
     public void ApplyTheme(UiTheme theme, UiFonts fonts, float scale)
@@ -1038,44 +1145,27 @@ internal sealed class FieldHost : Panel, IThemed
     }
 }
 
-/// <summary>A Windows 11 toggle switch with "On"/"Off" beside it. Click or Space switches it.</summary>
-internal sealed class ToggleSwitch : Control, IThemed
+/// <summary>
+/// A Windows 11 on/off switch, with "On" or "Off" before it. Underneath it is a check box, so the keyboard (Space),
+/// Narrator (its on/off state, and the change) and Voice Access treat it as one; only the drawing is its own.
+/// </summary>
+internal sealed class ToggleSwitch : CheckBox, IThemed
 {
     private UiTheme? _theme;
     private UiFonts? _fonts;
     private float _scale = 1;
-    private bool _checked;
     private bool _hover;
 
     public ToggleSwitch()
     {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw
-            | ControlStyles.Selectable | ControlStyles.StandardClick, true);
-        TabStop = true;
-        AccessibleRole = AccessibleRole.CheckButton;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        AutoSize = false;
+        Text = "";
         Cursor = Cursors.Hand;
     }
 
-    public event EventHandler? CheckedChanged;
-
-    [Browsable(false)]
-    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public bool Checked
-    {
-        get => _checked;
-        set
-        {
-            if (_checked == value)
-            {
-                return;
-            }
-
-            _checked = value;
-            AccessibleDescription = value ? "On" : "Off";
-            Invalidate();
-            CheckedChanged?.Invoke(this, EventArgs.Empty);
-        }
-    }
+    /// <summary>Room right of the switch for its keyboard focus ring (the layout lets it reach past the column's edge).</summary>
+    public int RingRoom => D(4);
 
     public void ApplyTheme(UiTheme theme, UiFonts fonts, float scale)
     {
@@ -1087,25 +1177,10 @@ internal sealed class ToggleSwitch : Control, IThemed
         Invalidate();
     }
 
-    /// <summary>Room right of the switch for its keyboard focus ring (the layout lets it reach past the column's edge).</summary>
-    public int RingRoom => D(4);
-
-    protected override void OnClick(EventArgs e)
+    protected override void OnCheckedChanged(EventArgs e)
     {
-        base.OnClick(e);
-        Focus();
-        Checked = !Checked;
-    }
-
-    protected override void OnKeyUp(KeyEventArgs e)
-    {
-        if (e.KeyCode == Keys.Space)
-        {
-            Checked = !Checked;
-            e.Handled = true;
-        }
-
-        base.OnKeyUp(e);
+        base.OnCheckedChanged(e);
+        Invalidate();
     }
 
     protected override void OnMouseEnter(EventArgs e)
@@ -1142,12 +1217,18 @@ internal sealed class ToggleSwitch : Control, IThemed
         }
 
         Graphics g = e.Graphics;
+        using (var card = new SolidBrush(_theme.Card))
+        {
+            g.FillRectangle(card, ClientRectangle);
+        }
+
+        bool on = Checked;
         var track = new RectangleF(Width - RingRoom - D(42) + 0.5f, ((Height - D(20)) / 2f) + 0.5f, D(40) - 1, D(20) - 1);
-        TextRenderer.DrawText(g, _checked ? "On" : "Off", _fonts.Body, new Rectangle(0, 0, (int)track.Left - D(12), Height), _theme.Text, _theme.Card,
+        TextRenderer.DrawText(g, on ? "On" : "Off", _fonts.Body, new Rectangle(0, 0, (int)track.Left - D(12), Height), Enabled ? _theme.Text : _theme.DisabledText, _theme.Card,
             TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using GraphicsPath shape = Glyphs.Rounded(track, track.Height / 2);
-        if (_checked)
+        if (on)
         {
             using var fill = new SolidBrush(_hover ? UiTheme.Blend(_theme.Accent, _theme.Card, 0.9) : _theme.Accent);
             g.FillPath(fill, shape);
@@ -1162,8 +1243,8 @@ internal sealed class ToggleSwitch : Control, IThemed
 
         float knob = (_hover ? 14 : 12) * _scale;
         float centerY = track.Top + (track.Height / 2);
-        float centerX = _checked ? track.Right - (track.Height / 2) : track.Left + (track.Height / 2);
-        using (var brush = new SolidBrush(_checked ? _theme.AccentText : _theme.SecondaryText))
+        float centerX = on ? track.Right - (track.Height / 2) : track.Left + (track.Height / 2);
+        using (var brush = new SolidBrush(on ? _theme.AccentText : _theme.SecondaryText))
         {
             g.FillEllipse(brush, centerX - (knob / 2), centerY - (knob / 2), knob, knob);
         }
@@ -1470,5 +1551,17 @@ internal sealed class PillButton : Control, IButtonControl, IThemed
         }
     }
 
+    protected override AccessibleObject CreateAccessibilityInstance() => new PillAccessibleObject(this);
+
     private int D(float dip) => (int)Math.Round(dip * _scale);
+
+    /// <summary>Narrator's "press" and Voice Access' "click Save" press the button, as with any Windows button.</summary>
+    private sealed class PillAccessibleObject(PillButton owner) : ControlAccessibleObject(owner)
+    {
+        public override string DefaultAction => "Press";
+
+        public override AccessibleStates State => owner.Enabled ? base.State : base.State | AccessibleStates.Unavailable;
+
+        public override void DoDefaultAction() => owner.PerformClick();
+    }
 }

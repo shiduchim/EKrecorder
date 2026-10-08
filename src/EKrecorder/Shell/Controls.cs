@@ -160,13 +160,20 @@ internal sealed class StepSlider : Control, IThemed
             }
 
             _value = clamped;
-            AccessibleDescription = _labels.Length >= clamped ? _labels[clamped - 1] : null;
             Invalidate();
+            if (IsHandleCreated)
+            {
+                AccessibilityNotifyClients(AccessibleEvents.ValueChange, -1); // Narrator says the new step
+            }
+
             ValueChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 
     protected override Size DefaultSize => new(360, 48);
+
+    /// <summary>The chosen step's name ("4K", "128").</summary>
+    private string CurrentLabel => _labels.Length >= _value ? _labels[_value - 1] : "";
 
     /// <summary>The height the track and the step names need.</summary>
     public int NeededHeight => _fonts is null ? Height : (int)Math.Ceiling(Px(12) + Px(8) + Px(6) + _fonts.CaptionStrong.Height + Px(2));
@@ -356,6 +363,24 @@ internal sealed class StepSlider : Control, IThemed
         return best;
     }
 
+    protected override AccessibleObject CreateAccessibilityInstance() => new SliderAccessibleObject(this);
+
+    /// <summary>Narrator reads the chosen step as the slider's value.</summary>
+    private sealed class SliderAccessibleObject(StepSlider owner) : ControlAccessibleObject(owner)
+    {
+        public override string? Value
+        {
+            get => owner.CurrentLabel;
+            set
+            {
+                int step = Array.IndexOf(owner._labels, value);
+                if (step >= 0)
+                {
+                    owner.Value = step + 1;
+                }
+            }
+        }
+    }
 }
 
 /// <summary>

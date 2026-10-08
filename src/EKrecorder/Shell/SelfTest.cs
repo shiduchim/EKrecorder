@@ -320,6 +320,7 @@ internal sealed class SelfTest : ApplicationContext
         using var window = new MessageWindow();
         using var hotkeys = new HotkeyManager(window.Handle);
         var settings = new AppSettings { MonitorId = "test-monitor-2", MonitorName = "LS32D80xU" };
+        hotkeys.Register(settings.Hotkey); // as the tray holds it (a refused one would show "Not working now")
         using var form = new SettingsForm(settings, monitors, hotkeys, _ => null, _ => { });
         float scale = _scale ?? form.DeviceDpi / 96f;
         form.ForceScale(scale);

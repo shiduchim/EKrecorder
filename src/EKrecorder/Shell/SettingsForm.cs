@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Windows.Forms.Automation;
 using EKrecorder.App;
 using EKrecorder.Audio;
 using EKrecorder.Diagnostics;
@@ -141,6 +142,9 @@ internal sealed class SettingsForm : Form
         Controls.Add(_content);
         _banner.Paint += PaintBanner;
         _banner.Visible = false;
+        _banner.AccessibleRole = AccessibleRole.StaticText;
+        _banner.AccessibleName = "Recording now. Changes apply to the next recording.";
+        _micStatus.Link.AccessibleName = "Unmute microphone";
 
         AcceptButton = _save;
         CancelButton = _cancel;
@@ -332,6 +336,10 @@ internal sealed class SettingsForm : Form
 
         _recording = recording;
         LayoutAll();
+        if (recording && Visible && ContainsFocus)
+        {
+            AccessibilityObject.RaiseAutomationNotification(AutomationNotificationKind.Other, AutomationNotificationProcessing.ImportantMostRecent, _banner.AccessibleName!);
+        }
     }
 
     /// <summary>Fills the device lists and names Windows' defaults (listing does not open any device).</summary>
@@ -392,10 +400,10 @@ internal sealed class SettingsForm : Form
         }
 
         float before = _scale;
-        base.OnLoad(e); // centres the window on the monitor under the pointer
-        if (Math.Abs(_scale - before) > 0.001f)
+        base.OnLoad(e); // picks the monitor under the pointer; it may have another scale (the window is laid out again)
+        if (StartPosition == FormStartPosition.CenterScreen || Math.Abs(_scale - before) > 0.001f)
         {
-            // That monitor has another scale, so the window was laid out again at another size: centred again.
+            // Centred at its final size (fitted to a short screen, or at that monitor's scale).
             CenterToScreen();
         }
     }
@@ -884,6 +892,8 @@ internal sealed class SettingsForm : Form
             _shortcutCard.SubtitleColor = null;
         }
 
+        _shortcut.AccessibleDescription = _shortcutCard.Subtitle; // what the card says, for Narrator in the box
+
         if (!_meterTimer.Enabled)
         {
             ShowDevicesIdle();
@@ -906,6 +916,8 @@ internal sealed class SettingsForm : Form
         _folderCard.Subtitle = FriendlyPath(_folder);
         _folderCard.SubtitleColor = null;
         _tips.SetToolTip(_folderCard, _folder);
+        _tips.SetToolTip(_browse, _folder); // also shown when the button gets the keyboard focus
+        _browse.AccessibleDescription = _folder;
         if (_folderCheck is not { } check || !string.Equals(check.Folder, _folder, StringComparison.OrdinalIgnoreCase))
         {
             return;
@@ -1058,6 +1070,12 @@ internal sealed class SettingsForm : Form
             InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, "", ""),
             _ => ("Connecting…", (Color?)null, "", ""),
         };
+        if (link.Length == 0 && _micStatus.Link.ContainsFocus)
+        {
+            // The Unmute link is about to go (it worked): the focus stays on this card instead of jumping on.
+            _microphone.Focus();
+        }
+
         ShowInput(_micCard, _micMeter, _micStatus, status, capturing && _micMuted != true, text, color, glyph, link);
         _micCard.GlyphColor = _micMuted == true || status.State is InputState.NoDevice or InputState.Lost or InputState.Retrying ? color : null;
         _micCard.Glyph = _micMuted == true ? Glyphs.MicrophoneOff : Glyphs.Microphone;
@@ -1219,6 +1237,7 @@ internal sealed class SettingsForm : Form
         {
             _shortcut.Focus();
             System.Media.SystemSounds.Beep.Play();
+            _shortcut.AccessibilityObject.RaiseAutomationNotification(AutomationNotificationKind.Other, AutomationNotificationProcessing.ImportantMostRecent, _shortcutProblem ?? "");
             return;
         }
 
