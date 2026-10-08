@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
+using System.Windows.Forms.Automation;
 using EKrecorder.App;
 
 namespace EKrecorder.Shell;
@@ -161,9 +162,15 @@ internal sealed class StepSlider : Control, IThemed
 
             _value = clamped;
             Invalidate();
-            if (IsHandleCreated)
+            if (IsHandleCreated && AccessibilityObject is ControlAccessibleObject accessible)
             {
-                AccessibilityNotifyClients(AccessibleEvents.ValueChange, -1); // Narrator says the new step
+                // Narrator says the new step. (Through the accessible object: WinForms 10.0's
+                // Control.AccessibilityNotifyClients sends nothing unless an opt-out switch is set.)
+                accessible.NotifyClients(AccessibleEvents.ValueChange, -1);
+                if (Focused)
+                {
+                    accessible.RaiseAutomationNotification(AutomationNotificationKind.ActionCompleted, AutomationNotificationProcessing.MostRecent, CurrentLabel);
+                }
             }
 
             ValueChanged?.Invoke(this, EventArgs.Empty);

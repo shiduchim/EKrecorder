@@ -1058,17 +1058,17 @@ internal sealed class SettingsForm : Form
         }
 
         _micHeard |= capturing && status.Level >= HeardLevel;
-        (string text, Color? color, string glyph, string link) = status.State switch
+        (string text, Color? color, string glyph, string link, bool problem) = status.State switch
         {
-            InputState.Running or InputState.Fallback when _micMuted == true => ("Muted in Windows", _theme.Error, "", "Unmute"),
-            InputState.Running or InputState.Fallback when status.Warning is not null && !_micHeard => ("No sound · check the mic's mute switch", _theme.Warning, "", ""),
-            InputState.Fallback when Choice().MicrophoneId is null => ("Default mic not responding · using another one", _theme.Warning, "", ""),
-            InputState.Fallback => ("Not available · Windows default is used", _theme.Warning, "", ""),
-            InputState.Running when _micHeard => ("Working", _theme.Success, Glyphs.CheckMark, ""),
-            InputState.Running => ("Speak to test", (Color?)null, "", ""),
-            InputState.NoDevice => ("No microphone found", _theme.Warning, "", ""),
-            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, "", ""),
-            _ => ("Connecting…", (Color?)null, "", ""),
+            InputState.Running or InputState.Fallback when _micMuted == true => ("Muted in Windows", _theme.Error, "", "Unmute", true),
+            InputState.Running or InputState.Fallback when status.Warning is not null && !_micHeard => ("No sound · check the mic's mute switch", _theme.Warning, "", "", true),
+            InputState.Fallback when Choice().MicrophoneId is null => ("Default mic not responding · using another one", _theme.Warning, "", "", true),
+            InputState.Fallback => ("Not available · Windows default is used", _theme.Warning, "", "", true),
+            InputState.Running when _micHeard => ("Working", _theme.Success, Glyphs.CheckMark, "", false),
+            InputState.Running => ("Speak to test", (Color?)null, "", "", false),
+            InputState.NoDevice => ("No microphone found", _theme.Warning, "", "", true),
+            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, "", "", true),
+            _ => ("Connecting…", (Color?)null, "", "", false),
         };
         if (link.Length == 0 && _micStatus.Link.ContainsFocus)
         {
@@ -1076,7 +1076,7 @@ internal sealed class SettingsForm : Form
             _microphone.Focus();
         }
 
-        ShowInput(_micCard, _micMeter, _micStatus, status, capturing && _micMuted != true, text, color, glyph, link);
+        ShowInput(_micCard, _micMeter, _micStatus, status, capturing && _micMuted != true, text, color, glyph, link, problem);
         _micCard.GlyphColor = _micMuted == true || status.State is InputState.NoDevice or InputState.Lost or InputState.Retrying ? color : null;
         _micCard.Glyph = _micMuted == true ? Glyphs.MicrophoneOff : Glyphs.Microphone;
     }
@@ -1091,20 +1091,20 @@ internal sealed class SettingsForm : Form
         }
 
         bool playing = _outputHeardAt > 0 && now - _outputHeardAt < 1500;
-        (string text, Color? color, string glyph) = status.State switch
+        (string text, Color? color, string glyph, bool problem) = status.State switch
         {
-            InputState.Fallback => ("Not available · Windows default is used", _theme.Warning, ""),
-            InputState.Running when playing => ("Working", _theme.Success, Glyphs.CheckMark),
-            InputState.Running => ("Nothing playing", (Color?)null, ""),
-            InputState.NoDevice => ("No speakers or headset found", _theme.Warning, ""),
-            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, ""),
-            _ => ("Connecting…", (Color?)null, ""),
+            InputState.Fallback => ("Not available · Windows default is used", _theme.Warning, "", true),
+            InputState.Running when playing => ("Working", _theme.Success, Glyphs.CheckMark, false),
+            InputState.Running => ("Nothing playing", (Color?)null, "", false),
+            InputState.NoDevice => ("No speakers or headset found", _theme.Warning, "", true),
+            InputState.Lost or InputState.Retrying => ("Not connected · trying again", _theme.Warning, "", true),
+            _ => ("Connecting…", (Color?)null, "", false),
         };
-        ShowInput(_outputCard, _outputMeter, _outputStatus, status, capturing, text, color, glyph, "");
+        ShowInput(_outputCard, _outputMeter, _outputStatus, status, capturing, text, color, glyph, "", problem);
     }
 
     /// <summary>The meter and status of one input; without a working device the status takes the whole line.</summary>
-    private void ShowInput(Card card, LevelMeter meter, StatusLine status, AudioInputStatus input, bool showMeter, string text, Color? color, string glyph, string link)
+    private void ShowInput(Card card, LevelMeter meter, StatusLine status, AudioInputStatus input, bool showMeter, string text, Color? color, string glyph, string link, bool problem)
     {
         if (meter.Shown != showMeter)
         {
@@ -1115,7 +1115,7 @@ internal sealed class SettingsForm : Form
 
         meter.Active = showMeter;
         meter.Push(input.Level);
-        status.Show(text, color, glyph, link);
+        status.Show(text, color, glyph, link, problem);
     }
 
     /// <summary>Once a second, off the window thread: is the microphone muted in Windows?</summary>

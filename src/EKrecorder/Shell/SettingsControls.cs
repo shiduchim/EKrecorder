@@ -288,13 +288,14 @@ internal sealed class MonitorPicker : Control, IThemed
             AccessibleDescription = _monitors.FirstOrDefault(m => m.Id == value)?.Description;
             Invalidate();
             int index = SelectedIndex();
-            if (IsHandleCreated && index >= 0)
+            if (IsHandleCreated && index >= 0 && AccessibilityObject is ControlAccessibleObject accessible)
             {
-                // Narrator hears which monitor the arrow keys picked.
-                AccessibilityNotifyClients(AccessibleEvents.Selection, index);
+                // Narrator hears which monitor the arrow keys picked. (Through the accessible object: WinForms 10.0's
+                // Control.AccessibilityNotifyClients sends nothing unless an opt-out switch is set.)
+                accessible.NotifyClients(AccessibleEvents.Selection, index);
                 if (Focused)
                 {
-                    AccessibilityNotifyClients(AccessibleEvents.Focus, index);
+                    accessible.NotifyClients(AccessibleEvents.Focus, index);
                     AccessibilityObject.RaiseAutomationNotification(AutomationNotificationKind.ActionCompleted, AutomationNotificationProcessing.MostRecent, _monitors[index].Description);
                 }
             }
@@ -744,8 +745,11 @@ internal sealed class StatusLine : Control, IThemed
     /// <summary>The link after the text ("Unmute"); hidden while it has no text.</summary>
     public PillButton Link { get; } = new();
 
-    /// <summary>Sets what the line says. <paramref name="color"/> null: the usual grey.</summary>
-    public void Show(string text, Color? color = null, string glyph = "", string link = "")
+    /// <summary>
+    /// Sets what the line says. <paramref name="color"/> null: the usual grey. A <paramref name="problem"/> is said out
+    /// loud to Narrator when it appears (the colour cannot tell: in high contrast every line has the same one).
+    /// </summary>
+    public void Show(string text, Color? color = null, string glyph = "", string link = "", bool problem = false)
     {
         if (Text == text && _color == color && _glyph == glyph && Link.Text == link)
         {
@@ -761,8 +765,7 @@ internal sealed class StatusLine : Control, IThemed
         Link.Visible = link.Length > 0;
         PlaceLink();
         Invalidate();
-        if (changed && text.Length > 0 && _theme is not null && color is { } shown && (shown == _theme.Warning || shown == _theme.Error)
-            && IsHandleCreated && FindForm() is { ContainsFocus: true })
+        if (changed && problem && text.Length > 0 && IsHandleCreated && FindForm() is { ContainsFocus: true })
         {
             // A problem is said out loud once (the line itself cannot take the focus).
             AccessibilityObject.RaiseAutomationNotification(AutomationNotificationKind.Other, AutomationNotificationProcessing.ImportantMostRecent, text);
